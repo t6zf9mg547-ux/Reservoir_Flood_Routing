@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------------------
+# pyproject.toml for Reservoir_Flood_Routing
+#   1. Run `uv sync` to create .venv and install everything listed here
+#   2. Add/remove packages as needed with `uv add <pkg>` / `uv remove <pkg>`
+# ---------------------------------------------------------------------------
+
+[project]
+name = "reservoir-flood-routing"
+version = "0.1.0"
+description = "RK4 reservoir flood routing kernel (single dam, multiple outlets)"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.0",
+    "matplotlib>=3.9",
+    "pymoo>=0.6",       # NSGA-II optimizer for Layer 2 (rule-curve optimization)
+    "tqdm>=4.66",       # progress bars for Monte Carlo batches (Layer 3)
+]
+
+# Notes:
+# - scipy is not currently used (reservoir.py uses numpy's np.interp, not
+#   scipy.interpolate) -- add "scipy>=1.14" here if you later swap in a
+#   smoother interpolation method for the stage-surface curve.
+
+[tool.uv]
+# Scripts project (Module/), not an installable library -- skip building/
+# installing it as a package.
+package = false

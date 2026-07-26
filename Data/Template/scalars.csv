@@ -1,0 +1,8 @@
+name,value,unit
+t_max,172800,s
+dt,300,s
+print_every,12,steps
+H0,97.0,m_asl
+dam_crest_level,104.0,m_asl
+max_flood_level,102.5,m_asl
+downstream_threshold_m3s,100,m3/s

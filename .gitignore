@@ -1,0 +1,50 @@
+# -----------------------------------------------------------------------
+# .gitignore -- tracks all top-level project files (README, pyproject.toml,
+# uv.lock, etc.) normally. Among subfolders, only Module/ and
+# Data/Template/ are tracked -- Output/, Plot/, and any other
+# Data/<CaseName>/ folder are excluded.
+# -----------------------------------------------------------------------
+
+# Generated output -- regenerated locally, not tracked in git
+/Output/
+/Plot/
+
+# Data/: keep only the generic Template case; ignore every other case folder
+/Data/*
+!/Data/Template/
+
+# Virtual environment
+.venv/
+
+# uv
+# (keep uv.lock tracked in git so installs are reproducible across machines -
+#  do NOT ignore it unless you have a specific reason to)
+
+# Python cache / bytecode
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Environment / secrets
+.env
+.env.*
+
+# OS junk
+**/.DS_Store
+**/Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+**/*.swp
+
+# Jupyter
+**/.ipynb_checkpoints/
+
+# Logs
+*.log
