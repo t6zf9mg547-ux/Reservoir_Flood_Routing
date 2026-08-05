@@ -7,7 +7,7 @@ Lives in Module/. Run with:
                                 [--rule baseline|optimized] [--seed N]
 
 e.g.
-    python Module/mc_layer3.py <CaseName> --n-outer 20 --n-inner 100
+    python Module/mc_layer3.py <CaseName> --n-outer 100 --n-inner 150
 
 Layer 3: RMC-RFA-style TWO-LOOP Monte Carlo for climate-change-aware
 flood frequency analysis.
@@ -321,11 +321,24 @@ def default_outer_sampler(rng: np.random.Generator, n_outer: int,
 
 def default_inner_sampler(rng: np.random.Generator, n_inner: int,
                            uncertain_params: dict, h0_sigma: float,
-                           area_cv: float) -> list[dict]:
+                           area_cv: float, gate_availability: dict | None = None
+                           ) -> list[dict]:
     """INNER loop draws: physical/rating multipliers (whatever the case
     declares via mc_uncertain_params()), plus the two generic,
-    case-independent draws every case gets: H0 shift and reservoir
-    area_scale."""
+    case-independent draws every case gets (H0 shift and reservoir
+    area_scale), plus -- if the case declares mc_gate_availability() --
+    which (if any) of its named gates fail to open this draw.
+
+    Gate failure: every gate in gate_availability["gates"] is drawn as
+    an INDEPENDENT Bernoulli(p_fail) trial, using the SAME p_fail for
+    every gate (per-user decision -- gate unavailability is modeled as
+    a shared equipment/maintenance-driven rate across identical gates,
+    not per-gate-specific data). This exactly reproduces the standard
+    binomial screening model P(K=k) = C(n,k)*p^k*(1-p)^(n-k) for the
+    number of gates K that fail to open, with n = len(gates). Common-
+    cause (correlated) failure is explicitly NOT modeled here -- these
+    draws are independent, matching the binomial model's own stated
+    scope (see the reference table this was validated against)."""
     draws = []
     sampled_cols = {}
     for name, spec in uncertain_params.items():
@@ -340,10 +353,19 @@ def default_inner_sampler(rng: np.random.Generator, n_inner: int,
     h0_shift = rng.normal(0.0, h0_sigma, n_inner) if h0_sigma > 0 else np.zeros(n_inner)
     area_scale = _lognormal_cv(rng, area_cv, n_inner)
 
+    gates = list(gate_availability["gates"]) if gate_availability else []
+    p_fail = gate_availability.get("p_fail", 0.0) if gate_availability else 0.0
+    # n_inner x n_gates independent Bernoulli(p_fail) trials, drawn
+    # once here (vectorized, same as every other inner-loop quantity)
+    # rather than per-draw in the caller's loop.
+    gate_fail_draws = (rng.random((n_inner, len(gates))) < p_fail) if gates else None
+
     for i in range(n_inner):
         d = {name: float(col[i]) for name, col in sampled_cols.items()}
         d["H0_shift"] = float(h0_shift[i])
         d["area_scale"] = float(area_scale[i])
+        d["gates_failed"] = ([g for g, failed in zip(gates, gate_fail_draws[i]) if failed]
+                              if gates else [])
         draws.append(d)
     return draws
 
@@ -352,12 +374,13 @@ def default_inner_sampler(rng: np.random.Generator, n_inner: int,
 # Case setup
 # ---------------------------------------------------------------------
 
-def call_build_outlets(case_config, rule_overrides, physical_overrides, inflow):
+def call_build_outlets(case_config, rule_overrides, physical_overrides, inflow,
+                        gates_out_of_service=None):
     """Calls case_config.build_outlets() passing only the kwargs it
     actually accepts, so cases not yet updated for Layer 3 (no
-    physical_overrides/inflow params) still run -- just without inner-
-    loop physical perturbation or outer-loop inflow propagation into
-    any private Hydrograph copy the case loads for itself. Warns once
+    physical_overrides/inflow/gates_out_of_service params) still run --
+    just without inner-loop physical perturbation, outer-loop inflow
+    propagation, or gate-availability draws, respectively. Warns once
     per missing capability (tracked via function attributes) rather
     than spamming per draw."""
     sig = inspect.signature(case_config.build_outlets)
@@ -377,6 +400,14 @@ def call_build_outlets(case_config, rule_overrides, physical_overrides, inflow):
         # can't easily detect that from here, so this is a soft note,
         # not an error; most cases don't need it at all.
         call_build_outlets._warned_inflow = True
+    if "gates_out_of_service" in sig.parameters:
+        kwargs["gates_out_of_service"] = gates_out_of_service or []
+    elif gates_out_of_service and not getattr(call_build_outlets, "_warned_gates", False):
+        print("  NOTE: this case's build_outlets() doesn't accept gates_out_of_service -- "
+              "inner-loop gate-availability draws will NOT apply (gates are always "
+              "treated as operational regardless of mc_gate_availability() draws). "
+              "See Data/Corumana_117_Q5000/case_config.py for the pattern to add it.")
+        call_build_outlets._warned_gates = True
     return case_config.build_outlets(**kwargs)
 
 
@@ -448,8 +479,17 @@ def build_case(case_name: str, rule: str = "baseline"):
               "case's own hydrograph peak), not a real flood-frequency curve. See "
               "Data/Template/case_config.py for the pattern to add it.")
 
+    gate_availability = None
+    if hasattr(case_config, "mc_gate_availability"):
+        gate_availability = case_config.mc_gate_availability()
+    else:
+        print(f"  NOTE: {case_name}/case_config.py has no mc_gate_availability() -- "
+              "inner loop will assume every gate stays operational (no gate "
+              "failure-to-open risk modeled). See Data/Corumana_117_Q5000/"
+              "case_config.py or Data/Template/case_config.py for the pattern to add it.")
+
     return (case_config, case_dir, reservoir_base, inflow_base, withdrawal, sc,
-            rule_overrides, uncertain_params, outer_dist)
+            rule_overrides, uncertain_params, outer_dist, gate_availability)
 
 
 # ---------------------------------------------------------------------
@@ -459,7 +499,8 @@ def build_case(case_name: str, rule: str = "baseline"):
 def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
                      rule: str = "baseline") -> tuple[list[dict], dict]:
     (case_config, case_dir, reservoir_base, inflow_base, withdrawal, sc,
-     rule_overrides, uncertain_params, outer_dist) = build_case(case_name, rule)
+     rule_overrides, uncertain_params, outer_dist,
+     gate_availability) = build_case(case_name, rule)
 
     h0_sigma = sc.get("mc_h0_sigma", H0_DEFAULT_SIGMA)
     area_cv = sc.get("mc_area_cv", AREA_DEFAULT_CV)
@@ -470,51 +511,102 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
     t_max, dt = sc["t_max"], sc["dt"]
     print_every = int(sc.get("print_every", 1))
 
+    # A case can set mc_outer_peak_cv/mc_outer_volume_cv in its OWN
+    # scalars.csv as an EXPLICIT judgment call on the spread, distinct
+    # from just leaving it unset (which falls back to either the
+    # generic OUTER_DEFAULT_CV/VOLUME_DEFAULT_CV, or -- if real
+    # alt_studies/duration data is available below -- the data-derived
+    # spread). Captured as None-if-absent here (not yet defaulted) so
+    # the derivation logic below can tell "the case didn't set this"
+    # apart from "the case explicitly wants this exact number," and
+    # let an explicit override win even when real derivation data is
+    # ALSO available -- i.e. "use the real curve/table for the MEDIAN
+    # (the anchor value), but I want to set the SPREAD myself" is now
+    # a supported combination, not just all-or-nothing.
+    explicit_peak_cv = sc.get("mc_outer_peak_cv")
+    explicit_volume_cv = sc.get("mc_outer_volume_cv")
+
     outer_source = "placeholder"
-    outer_cv = sc.get("mc_outer_peak_cv", OUTER_DEFAULT_CV)
-    volume_cv = sc.get("mc_outer_volume_cv", VOLUME_DEFAULT_CV)
+    outer_cv = explicit_peak_cv if explicit_peak_cv is not None else OUTER_DEFAULT_CV
+    volume_cv = explicit_volume_cv if explicit_volume_cv is not None else VOLUME_DEFAULT_CV
     median_scale = 1.0
     volume_median_scale = 1.0
     target_return_period = None
     if outer_dist is not None:
-        curve_T, curve_Q = load_flood_frequency_curve(outer_dist["curve_csv"])
-        target_return_period = outer_dist["target_return_period"]
-        anchor_Q = _loglog_interp(target_return_period, curve_T, curve_Q)
-        base_peak = float(max(inflow_base.Q))
-        median_scale = anchor_Q / base_peak
-        derived_cv = derive_outer_cv_from_alt_studies(
-            curve_T, curve_Q, outer_dist["alt_studies_csv"])
-        if derived_cv is not None:
-            outer_cv = derived_cv
-            outer_source = "flood_frequency_curve + alt_studies (real data)"
-        else:
-            outer_source = "flood_frequency_curve (median only; CV still placeholder)"
-        print(f"  Outer loop (peak): targeting T={target_return_period}-yr flood, "
-              f"curve peak={anchor_Q:.0f} m3/s vs. this case's own hydrograph peak="
-              f"{base_peak:.0f} m3/s -> median scale={median_scale:.4f}, "
-              f"cv={outer_cv:.4f} ({outer_source})")
+        try:
+            curve_T, curve_Q = load_flood_frequency_curve(outer_dist["curve_csv"])
+            target_return_period = outer_dist["target_return_period"]
+            anchor_Q = _loglog_interp(target_return_period, curve_T, curve_Q)
+            base_peak = float(max(inflow_base.Q))
+            median_scale = anchor_Q / base_peak
+            derived_cv = derive_outer_cv_from_alt_studies(
+                curve_T, curve_Q, outer_dist["alt_studies_csv"])
+            if explicit_peak_cv is not None:
+                outer_cv = explicit_peak_cv
+                outer_source = ("flood_frequency_curve (median: real data) + explicit "
+                                 "mc_outer_peak_cv override (spread: case-level judgment"
+                                 + (f", NOT the alt_studies-derived {derived_cv:.4f}"
+                                    if derived_cv is not None else "") + ")")
+            elif derived_cv is not None:
+                outer_cv = derived_cv
+                outer_source = "flood_frequency_curve + alt_studies (real data)"
+            else:
+                outer_source = "flood_frequency_curve (median only; CV still placeholder)"
+            print(f"  Outer loop (peak): targeting T={target_return_period}-yr flood, "
+                  f"curve peak={anchor_Q:.0f} m3/s vs. this case's own hydrograph peak="
+                  f"{base_peak:.0f} m3/s -> median scale={median_scale:.4f}, "
+                  f"cv={outer_cv:.4f} ({outer_source})")
+        except (FileNotFoundError, KeyError, ValueError, StopIteration) as e:
+            target_return_period = None
+            median_scale = 1.0
+            outer_cv = explicit_peak_cv if explicit_peak_cv is not None else OUTER_DEFAULT_CV
+            outer_source = "placeholder (mc_outer_distribution() set, but failed to load -- see warning above)"
+            print(f"  WARNING: {case_name}/case_config.py's mc_outer_distribution() points at "
+                  f"peak data that couldn't be read ({type(e).__name__}: {e}). Falling back to "
+                  f"the generic placeholder for the PEAK loop instead of stopping the run. Check "
+                  f"the 'curve_csv'/'alt_studies_csv' paths returned by mc_outer_distribution() "
+                  f"actually exist and are formatted as described in Data/Template/case_config.py.")
 
     volume_source = "placeholder (locked to peak_scale)"
     if outer_dist is not None and "volume_duration_csv" in outer_dist:
-        dv_T, dv_Q, dv_V = load_duration_volume_table(outer_dist["volume_duration_csv"])
-        anchor_V = _loglog_interp(target_return_period, dv_T, dv_V)
-        base_volume = float(np.sum(np.diff(inflow_base.t) *
-                                    (inflow_base.Q[:-1] + inflow_base.Q[1:]) / 2.0))  # m3
-        volume_median_scale = anchor_V / base_volume
-        derived_volume_cv = derive_volume_cv_from_duration_table(dv_T, dv_Q, dv_V)
-        if derived_volume_cv is not None:
-            volume_cv = derived_volume_cv
-            volume_source = "flood_duration_volume_table (real data, independent of peak)"
-        print(f"  Outer loop (volume, INDEPENDENT of peak): targeting T="
-              f"{target_return_period}-yr flood, table volume={anchor_V/1e6:.0f} Mm3 vs. "
-              f"this case's own hydrograph volume={base_volume/1e6:.0f} Mm3 -> "
-              f"median scale={volume_median_scale:.4f}, cv={volume_cv:.4f} ({volume_source})")
+        try:
+            dv_T, dv_Q, dv_V = load_duration_volume_table(outer_dist["volume_duration_csv"])
+            anchor_T = target_return_period if target_return_period is not None \
+                else outer_dist["target_return_period"]
+            anchor_V = _loglog_interp(anchor_T, dv_T, dv_V)
+            base_volume = float(np.sum(np.diff(inflow_base.t) *
+                                        (inflow_base.Q[:-1] + inflow_base.Q[1:]) / 2.0))  # m3
+            volume_median_scale = anchor_V / base_volume
+            derived_volume_cv = derive_volume_cv_from_duration_table(dv_T, dv_Q, dv_V)
+            if explicit_volume_cv is not None:
+                volume_cv = explicit_volume_cv
+                volume_source = ("flood_duration_volume_table (median: real data) + explicit "
+                                  "mc_outer_volume_cv override (spread: case-level judgment"
+                                  + (f", NOT the table-derived {derived_volume_cv:.4f}"
+                                     if derived_volume_cv is not None else "") + ")")
+            elif derived_volume_cv is not None:
+                volume_cv = derived_volume_cv
+                volume_source = "flood_duration_volume_table (real data, independent of peak)"
+            print(f"  Outer loop (volume, INDEPENDENT of peak): targeting T="
+                  f"{anchor_T}-yr flood, table volume={anchor_V/1e6:.0f} Mm3 vs. "
+                  f"this case's own hydrograph volume={base_volume/1e6:.0f} Mm3 -> "
+                  f"median scale={volume_median_scale:.4f}, cv={volume_cv:.4f} ({volume_source})")
+        except (FileNotFoundError, KeyError, ValueError, StopIteration) as e:
+            volume_median_scale = 1.0
+            volume_cv = explicit_volume_cv if explicit_volume_cv is not None else VOLUME_DEFAULT_CV
+            volume_source = "placeholder (mc_outer_distribution() set, but failed to load -- see warning above)"
+            print(f"  WARNING: {case_name}/case_config.py's mc_outer_distribution() points at "
+                  f"volume data that couldn't be read ({type(e).__name__}: {e}). Falling back to "
+                  f"the generic placeholder for the VOLUME loop instead of stopping the run. Check "
+                  f"the 'volume_duration_csv' path returned by mc_outer_distribution() actually "
+                  f"exists and is formatted as described in Data/Template/case_config.py.")
 
     rng = np.random.default_rng(seed)
     outer_draws = default_outer_sampler(rng, n_outer, outer_cv, volume_cv,
                                          median_scale, volume_median_scale)
     inner_draws_by_outer = [
-        default_inner_sampler(rng, n_inner, uncertain_params, h0_sigma, area_cv)
+        default_inner_sampler(rng, n_inner, uncertain_params, h0_sigma, area_cv,
+                               gate_availability)
         for _ in range(n_outer)
     ]
 
@@ -535,9 +627,10 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
                           reservoir_base.H_max)
 
             physical_overrides = {k: v for k, v in inner.items()
-                                   if k not in ("H0_shift", "area_scale")}
+                                   if k not in ("H0_shift", "area_scale", "gates_failed")}
             outlets = call_build_outlets(case_config, rule_overrides,
-                                          physical_overrides, scaled_inflow)
+                                          physical_overrides, scaled_inflow,
+                                          gates_out_of_service=inner["gates_failed"])
 
             result = run_simulation(scaled_reservoir, scaled_inflow, withdrawal,
                                      outlets, H0=H0_draw, t_max=t_max, dt=dt,
@@ -556,6 +649,8 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
                 **physical_overrides,
                 "H0_used": H0_draw,
                 "area_scale": inner["area_scale"],
+                "gates_failed": ",".join(inner["gates_failed"]),
+                "n_gates_failed": len(inner["gates_failed"]),
                 "peak_level": peak_level,
                 "peak_downstream_release": peak_release,
             }
@@ -583,6 +678,7 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
         "volume_median_scale": volume_median_scale,
         "h0_sigma": h0_sigma, "area_cv": area_cv, "rule": rule,
         "uncertain_params": uncertain_params,
+        "gate_availability": gate_availability,
     }
     return records, meta
 
@@ -631,7 +727,26 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
         f.write(f"Inner-loop H0 sigma [m]: {meta['h0_sigma']}, "
                 f"reservoir area_scale CV: {meta['area_cv']}\n")
         f.write(f"Inner-loop uncertain physical params: "
-                f"{list(meta['uncertain_params'].keys()) or '(none declared)'}\n\n")
+                f"{list(meta['uncertain_params'].keys()) or '(none declared)'}\n")
+        ga = meta.get("gate_availability")
+        if ga:
+            gates, p_fail = list(ga["gates"]), ga.get("p_fail", 0.0)
+            n = len(gates)
+            n_failed = np.array([r["n_gates_failed"] for r in records])
+            frac_any_failed = float(np.mean(n_failed >= 1))
+            # Closed-form P(K>=1) for n independent Bernoulli(p_fail)
+            # trials -- the same binomial screening model the gate-
+            # availability sampling itself implements -- as a sanity
+            # check that the empirical draws actually reproduce it.
+            expected_any_failed = 1.0 - (1.0 - p_fail) ** n if n else 0.0
+            f.write(f"Gate availability: {n} gates ({', '.join(gates)}), per-gate "
+                    f"failure-to-open probability p_fail={p_fail:.4f} (independent "
+                    f"draws, SAME rate for every gate; common-cause failure NOT modeled)\n")
+            f.write(f"P(>=1 gate failed) -- empirical over this run: {frac_any_failed:.4f}, "
+                    f"closed-form binomial: {expected_any_failed:.4f}\n")
+        else:
+            f.write("Gate availability: not modeled (no mc_gate_availability() declared)\n")
+        f.write("\n")
         f.write(f"Peak level [m a.s.l.]: P5={p5:.3f}  P50={p50:.3f}  P95={p95:.3f}  "
                 f"max={peak_levels.max():.3f}  min={peak_levels.min():.3f}\n")
         if meta["max_flood_level"] is not None:
@@ -644,6 +759,16 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
     print(f"\nWrote {csv_path}")
     print(f"Wrote {plot_path}")
     print(f"Wrote {summary_path}")
+    ga = meta.get("gate_availability")
+    if ga:
+        n_failed = np.array([r["n_gates_failed"] for r in records])
+        n_gates = len(ga["gates"])
+        p_fail = ga.get("p_fail", 0.0)
+        frac_any_failed = float(np.mean(n_failed >= 1))
+        expected_any_failed = 1.0 - (1.0 - p_fail) ** n_gates if n_gates else 0.0
+        print(f"P(>=1 gate failed) = {frac_any_failed:.4f} "
+              f"(closed-form binomial: {expected_any_failed:.4f}, "
+              f"n={n_gates}, p_fail={p_fail:.4f})")
     print(f"\nPeak level [m a.s.l.]: P5={p5:.3f}  P50={p50:.3f}  P95={p95:.3f} "
           f"(max_flood_level={meta['max_flood_level']}, dam_crest_level={meta['dam_crest_level']})")
     if meta["max_flood_level"] is not None:
@@ -705,8 +830,8 @@ def main():
     args = parser.parse_args()
 
     case_name = args.case_name or prompt_for_case(list_case_folders())
-    n_outer = args.n_outer if args.n_outer is not None else prompt_int("Number of outer (climate) draws", 20)
-    n_inner = args.n_inner if args.n_inner is not None else prompt_int("Number of inner (physical) draws", 100)
+    n_outer = args.n_outer if args.n_outer is not None else prompt_int("Number of outer (climate) draws", 100)
+    n_inner = args.n_inner if args.n_inner is not None else prompt_int("Number of inner (physical) draws", 150)
 
     print(f"\nRunning Layer 3 Monte Carlo for '{case_name}': "
           f"{n_outer} outer x {n_inner} inner = {n_outer * n_inner} simulations, "

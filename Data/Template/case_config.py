@@ -193,6 +193,50 @@ def build_outlets(rule_overrides: dict | None = None,
     # )
 
     # -------------------------------------------------------------
+    # ALTERNATIVE to the bundled gate_1 above: if you want gate-
+    # availability Monte Carlo (mc_gate_availability(), near the
+    # bottom of this file) to fail EACH bay independently -- rather
+    # than only knowing "how many of the 4 are down," with no notion
+    # of WHICH -- split gate_1 into 4 individually-named, independent
+    # GatedSpillway instances instead of one bundled n_gates_total=4
+    # object. Same physical/rating parameters (they're still identical
+    # gates), just not synchronized into one object -- this is exactly
+    # the pattern Data/Corumana_117_Q5000/case_config.py uses for its
+    # six real gates. Uncomment this block AND remove gate_1 above
+    # from the returned list (don't use both -- that would double-
+    # count the bays) to switch a case over to this pattern; you'll
+    # also need to add a `gates_out_of_service` parameter to this
+    # build_outlets() function, exactly as Data/Corumana_117_Q5000/
+    # case_config.py does (see its own build_outlets() docstring).
+    #
+    # GATE_1_BAY_NAMES = ["gate_1a", "gate_1b", "gate_1c", "gate_1d"]
+    # gate_1_bays = []
+    # for bay_name in GATE_1_BAY_NAMES:
+    #     bay_rule = level_trigger_rule(**gate_1_params)  # same rule/
+    #                                                       # params for
+    #                                                       # every bay
+    #                                                       # here --
+    #                                                       # edit per-
+    #                                                       # bay if
+    #                                                       # yours are
+    #                                                       # staggered
+    #                                                       # (staged_
+    #                                                       # trigger_
+    #                                                       # rule())
+    #     gate_1_bays.append(GatedSpillway(
+    #         name=bay_name,
+    #         sill_level=95.0, width=8.0, operating_rule=bay_rule,
+    #         discharge_coefficient=0.6 * po.get("gate_1_Cd_mult", 1.0),
+    #         free_flow_ratio=0.6,
+    #         free_flow_C=2.0 * po.get("gate_1_free_flow_C_mult", 1.0),
+    #         free_flow_N_piers=0, free_flow_Kp=0.0,
+    #         n_gates_total=1,  # ONE physical bay per instance now
+    #         on_off=bay_name not in (gates_out_of_service or []),
+    #     ))
+    # # ...then append gate_1_bays (instead of gate_1) to the returned
+    # # list at the bottom of this function.
+
+    # -------------------------------------------------------------
     # 3) Fuse gate (irreversible once triggered), WITH a pre-trip
     #    overflow -- many real fuse gates overtop (often via a
     #    labyrinth/folded crest, to pass more flow at lower head than
@@ -322,8 +366,8 @@ def mc_uncertain_params():
     it) before trusting Layer 3 results for any real decision.
 
     dist="lognormal_cv": multiplicative, median 1.0, given coefficient
-        of variation (e.g. cv=0.10 means the multiplier typically falls
-        within roughly +/-10% of 1.0).
+        of variation (e.g. cv=0.05 means the multiplier typically falls
+        within roughly +/-5% of 1.0).
     dist="normal": additive, given (mean, sigma) in the target
         parameter's own units.
 
@@ -334,12 +378,12 @@ def mc_uncertain_params():
     than error on.
     """
     return {
-        "spillway_1_C_mult": {"dist": "lognormal_cv", "cv": 0.10},
-        "gate_1_Cd_mult": {"dist": "lognormal_cv", "cv": 0.10},
-        "gate_1_free_flow_C_mult": {"dist": "lognormal_cv", "cv": 0.10},
-        "fuse_gate_1_pre_C_mult": {"dist": "lognormal_cv", "cv": 0.15},
-        "fuse_gate_1_post_C_mult": {"dist": "lognormal_cv", "cv": 0.15},
-        "bottom_outlet_1_Cd_mult": {"dist": "lognormal_cv", "cv": 0.10},
+        "spillway_1_C_mult": {"dist": "lognormal_cv", "cv": 0.05},
+        "gate_1_Cd_mult": {"dist": "lognormal_cv", "cv": 0.05},
+        "gate_1_free_flow_C_mult": {"dist": "lognormal_cv", "cv": 0.05},
+        "fuse_gate_1_pre_C_mult": {"dist": "lognormal_cv", "cv": 0.05},
+        "fuse_gate_1_post_C_mult": {"dist": "lognormal_cv", "cv": 0.05},
+        "bottom_outlet_1_Cd_mult": {"dist": "lognormal_cv", "cv": 0.05},
     }
 
 
@@ -387,6 +431,40 @@ def mc_uncertain_params():
 # inflow_hydrograph.csv, and prints a note saying so. Add the three
 # CSVs above (real data for your own case) and this function once you
 # have them.
+
+
+# mc_gate_availability() -- NOT defined for this template, deliberately
+# (same opt-in reasoning as mc_outer_distribution() above).
+#
+# Module/mc_layer3.py's inner loop can also model gate-failure-to-open
+# risk, IF a case declares which gates are eligible to fail and a
+# per-gate failure probability:
+#
+#   def mc_gate_availability():
+#       return {
+#           "gates": ["gate_1a", "gate_1b", "gate_1c", "gate_1d"],
+#           "p_fail": 0.05,   # SAME probability applied to EVERY gate
+#       }
+#
+# Each gate's outcome is drawn INDEPENDENTLY every inner draw (the
+# standard binomial screening model P(K=k) = C(n,k)*p^k*(1-p)^(n-k)
+# for the number of gates K that fail to open) -- NOT correlated/
+# common-cause failure, which this simple model does not attempt to
+# capture (a single maintenance lapse taking out several gates AT ONCE
+# would need a different, correlated sampling mechanism, not this one).
+#
+# This only makes sense for a case using INDIVIDUALLY NAMED gates (see
+# the "ALTERNATIVE to the bundled gate_1" block above) -- a case using
+# the bundled n_gates_total form has no individual gate identities for
+# this hook to refer to, and build_outlets() also needs its own
+# `gates_out_of_service` parameter added (see Data/Corumana_117_Q5000/
+# case_config.py for the full worked pattern, including how a gate
+# that's merely stuck closed -- as opposed to fully removed -- can
+# still be modeled as passively overtoppable).
+#
+# Without this hook, Layer 3 assumes every gate stays operational for
+# every draw (no failure-to-open risk modeled), and prints a note
+# saying so.
 
 
 def scalars(case_dir: str):

@@ -436,6 +436,17 @@ opt into something better-grounded via two optional hooks in its own
   See `Data/Template/case_config.py`'s comments for the exact function
   signature and file formats to copy.
 
+  **Overriding the derived spread while keeping the real median:** a
+  case's `scalars.csv` can set `mc_outer_peak_cv`/`mc_outer_volume_cv`
+  explicitly. If `mc_outer_distribution()` is ALSO set and derivation
+  from `alt_studies_csv`/`volume_duration_csv` succeeds, the explicit
+  scalar wins over the derived CV -- i.e. you can use the real
+  curve/table data for the MEDIAN (the actual design-flood anchor)
+  while setting the SPREAD yourself as an engineering-judgment number,
+  rather than it being all-or-nothing. Leave the scalar unset to keep
+  the old behavior (derived CV wins when available, generic default
+  otherwise).
+
 **Important caveat on `alt_studies_csv`-derived uncertainty:** the
 resulting CV is a measure of how much INDEPENDENT PAST STUDIES of the
 same structure have disagreed with each other over time -- a
@@ -456,12 +467,67 @@ implementing that bootstrap in place of (or alongside) the
 explicitly in any downstream reporting until it's done, since the
 current CV likely UNDERSTATES the true extrapolation uncertainty.
 
+**Gate-availability (failure-to-open) risk:** a third opt-in hook, in
+the same spirit as `mc_uncertain_params()`, but modeling a discrete
+failure event rather than a continuous physical/rating perturbation --
+whether each of a case's named gates actually opens at all this draw,
+not just how well it performs given that it does.
+
+- **`mc_gate_availability()`** -- declares which gates are eligible to
+  fail and a single per-gate failure probability, applied EQUALLY to
+  every named gate (gate unavailability is modeled as a shared
+  equipment/maintenance-driven rate across identical gates, not
+  per-gate-specific data):
+
+  ```python
+  def mc_gate_availability():
+      return {
+          "gates": ["gate_1", "gate_2", "gate_3", "gate_4", "gate_5", "gate_6"],
+          "p_fail": 0.05,   # SAME probability applied to EVERY gate
+      }
+  ```
+
+  Each inner draw, every listed gate's outcome is drawn INDEPENDENTLY
+  as a Bernoulli(`p_fail`) trial -- the standard binomial screening
+  model `P(K=k) = C(n,k)*p^k*(1-p)^(n-k)` for the number of gates `K`
+  that fail to open, `n = len(gates)`. Common-cause (correlated)
+  failure -- e.g. one maintenance lapse taking out several gates at
+  once -- is explicitly NOT modeled by this independent-draw
+  mechanism.
+
+  Only makes sense for a case whose gates are modeled as
+  INDIVIDUALLY NAMED outlet instances (see "Multiple identical
+  gates/outlets" above) -- a case using the bundled
+  `n_gates_total`/`n_gates_operational` form has no individual gate
+  identities for this hook to refer to. The case's `build_outlets()`
+  also needs a `gates_out_of_service` parameter (a list of gate names
+  to force out of service for one call, overriding whatever a case's
+  own module-level "out of service" list defaults to for a normal
+  run) -- see `Data/Corumana_117_Q5000/case_config.py` for the full
+  worked pattern, including how a gate that's merely stuck closed
+  (rather than fully removed) can still be modeled as passively
+  overtoppable via `on_off`/a substitute `FreeOverflowSpillway`, not
+  simply zero discharge.
+
+  Without this hook, Layer 3 assumes every gate stays operational for
+  every draw, and prints a note saying so -- same "not every case
+  needs every layer" fallback as the other two hooks.
+
 **Output**, mirroring Layer 1/2's own conventions:
 - `Output/<CaseName>/MonteCarlo/mc_results.csv` -- one row per draw,
-  every sampled parameter plus its outcome metrics
+  every sampled parameter plus its outcome metrics (including
+  `gates_failed` and `n_gates_failed`, present -- possibly always
+  empty/zero -- regardless of whether the case declares
+  `mc_gate_availability()`, so the column layout stays consistent
+  across cases)
 - `Output/<CaseName>/MonteCarlo/mc_summary.txt` -- headline percentiles,
-  exceedance probabilities, and exactly which sampling settings were
-  used (generic placeholder vs. case-provided real data, for both loops)
+  exceedance probabilities, exactly which sampling settings were used
+  (generic placeholder vs. case-provided real data, for all three
+  hooks), and -- if `mc_gate_availability()` is declared -- the
+  empirical `P(>=1 gate failed)` across the run alongside the
+  closed-form binomial value, as a sanity check that the independent
+  per-gate draws are behaving as the declared `p_fail`/gate count
+  would predict
 - `Plot/<CaseName>/MonteCarlo/mc_distribution.png` -- a histogram of
   peak levels pooled across all draws, alongside an exceedance curve
   (worst-to-best ranking) with each outer draw's own curve shown as a
