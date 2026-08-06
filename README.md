@@ -516,6 +516,43 @@ not just how well it performs given that it does.
   Bayesian updating), and `Data/Template/reliability/*.csv` for the
   illustrative input format.
 
+  **Switching between the two forms at run time**, without editing
+  `case_config.py` each time -- useful for a quick side-by-side
+  comparison. Combine both forms into one function, gated by a
+  module-level flag that reads an environment variable (defaulting to
+  the CI-evidence form if unset):
+
+  ```python
+  USE_CI_RELIABILITY = os.environ.get("USE_CI_RELIABILITY", "true") \
+      .strip().lower() not in ("0", "false", "no")
+  TIER0_P_FAIL = float(os.environ.get("GATE_P_FAIL", 0.05))
+
+  def mc_gate_availability():
+      if not USE_CI_RELIABILITY:
+          return {"gates": [...], "p_fail": TIER0_P_FAIL}
+      case_dir = os.path.dirname(os.path.abspath(__file__))
+      return build_gate_availability(
+          os.path.join(case_dir, "reliability", "components.csv"),
+          os.path.join(case_dir, "reliability", "common_cause_events.csv"),
+      )
+  ```
+
+  Then, from the command line, no code edits needed to switch:
+  ```
+  python Module/mc_layer3.py <CaseName> ...                                    # CI-evidence form (default)
+  USE_CI_RELIABILITY=false python Module/mc_layer3.py <CaseName> ...           # flat rate, default p_fail
+  USE_CI_RELIABILITY=false GATE_P_FAIL=0.10 python Module/mc_layer3.py <CaseName> ...  # flat rate, custom p_fail
+  ```
+
+  `Module/mc_layer3.py` itself never reads either environment variable
+  and has no branching logic for this at all -- the switch lives
+  entirely inside `case_config.py`'s own `mc_gate_availability()`,
+  which `mc_layer3.py` just calls and consumes the result of, same as
+  always. This keeps the same "case-specific choices live in
+  `case_config.py`, the engine stays generic" split used everywhere
+  else in this project -- see `Data/Template/case_config.py`'s
+  commented worked version of this pattern.
+
   **Sampling mechanism**, common to both forms -- each inner draw runs
   a two-stage process:
   1. Each declared common-cause group (CI-evidence form only) draws
