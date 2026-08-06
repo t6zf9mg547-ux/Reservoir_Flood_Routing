@@ -319,6 +319,62 @@ def default_outer_sampler(rng: np.random.Generator, n_outer: int,
             for p, v in zip(peak_scales, volume_scales)]
 
 
+def normalize_gate_availability(gate_availability: dict | None) -> dict | None:
+    """Accepts either shape a case's mc_gate_availability() may return,
+    and normalizes to the one internal shape default_inner_sampler()
+    actually consumes:
+
+        {"gates": [...],
+         "p_fail_by_gate": {gate_name: p, ...},
+         "ccf_groups": [{"label": str, "gates": [...], "p_ccf": float}, ...]}
+
+    TIER 0 -- {"gates": [...], "p_fail": p} -- a single flat rate
+        copied across every gate, no common-cause mechanism. This is
+        the original, simplest shape (a case with no CI evidence,
+        just one judgment-call rate); still fully supported.
+
+    TIER 1 -- {"gates": [...], "p_fail_by_gate": {...},
+        "ccf_groups": [...]} -- per-gate-differentiated rates plus
+        explicit common-cause branches, typically produced by
+        Module/reliability/gate_reliability.py's
+        build_gate_availability() from real CI evidence rather than
+        written by hand. Passed through with ccf_groups defaulted to
+        empty if the case's dict omits it.
+
+    Returns None if gate_availability is None (no hook declared at
+    all -- every gate assumed operational, same as before)."""
+    if gate_availability is None:
+        return None
+    gates = list(gate_availability["gates"])
+    if "p_fail_by_gate" in gate_availability:
+        p_fail_by_gate = dict(gate_availability["p_fail_by_gate"])
+        ccf_groups = list(gate_availability.get("ccf_groups", []))
+    else:
+        flat_p = gate_availability.get("p_fail", 0.0)
+        p_fail_by_gate = {g: flat_p for g in gates}
+        ccf_groups = []
+    return {"gates": gates, "p_fail_by_gate": p_fail_by_gate, "ccf_groups": ccf_groups}
+
+
+def expected_p_any_gate_failed(p_fail_by_gate: dict[str, float], ccf_groups: list[dict]) -> float:
+    """Closed-form P(at least one gate ends up failed), generalizing
+    the simple binomial formula to heterogeneous per-gate rates plus
+    independent common-cause groups. A gate is operational only if (a)
+    its own independent draw doesn't fail it, AND (b) no common-cause
+    group covering it fires -- both are independent Bernoulli events,
+    so P(ALL gates operational) is just the product of every one of
+    those "doesn't happen" probabilities; P(>=1 failed) is 1 minus
+    that. Reduces to the original 1-(1-p)**n when every gate shares
+    one flat rate and there are no CCF groups."""
+    p_all_ok = 1.0
+    for p in p_fail_by_gate.values():
+        p_all_ok *= (1.0 - p)
+    for grp in ccf_groups:
+        p_all_ok *= (1.0 - grp["p_ccf"])
+    return 1.0 - p_all_ok
+
+
+
 def default_inner_sampler(rng: np.random.Generator, n_inner: int,
                            uncertain_params: dict, h0_sigma: float,
                            area_cv: float, gate_availability: dict | None = None
@@ -329,16 +385,27 @@ def default_inner_sampler(rng: np.random.Generator, n_inner: int,
     area_scale), plus -- if the case declares mc_gate_availability() --
     which (if any) of its named gates fail to open this draw.
 
-    Gate failure: every gate in gate_availability["gates"] is drawn as
-    an INDEPENDENT Bernoulli(p_fail) trial, using the SAME p_fail for
-    every gate (per-user decision -- gate unavailability is modeled as
-    a shared equipment/maintenance-driven rate across identical gates,
-    not per-gate-specific data). This exactly reproduces the standard
-    binomial screening model P(K=k) = C(n,k)*p^k*(1-p)^(n-k) for the
-    number of gates K that fail to open, with n = len(gates). Common-
-    cause (correlated) failure is explicitly NOT modeled here -- these
-    draws are independent, matching the binomial model's own stated
-    scope (see the reference table this was validated against)."""
+    Gate failure, TWO independent stages per draw (see
+    normalize_gate_availability() for the input shapes this consumes):
+
+    1. COMMON-CAUSE: each named ccf_groups entry fires as its own
+       independent Bernoulli(p_ccf) trial. If it fires, every gate
+       named in that group's "gates" list is forced to the failed
+       state for this draw, regardless of its own individual outcome
+       below -- a shared control link, shared component batch/model,
+       or shared power source taking out multiple gates at once,
+       which independent per-gate draws alone can never represent no
+       matter how the per-gate rate is chosen.
+    2. INDEPENDENT: every gate not already forced failed by a
+       common-cause event is then drawn as its own Bernoulli
+       (p_fail_by_gate[gate]) trial -- per-gate rates, not
+       necessarily identical across gates (Tier 1), or all equal to
+       one flat rate (Tier 0, reproducing the original binomial
+       screening model exactly when ccf_groups is empty).
+
+    A gate's final state this draw is failed if EITHER stage says so
+    (logical OR) -- common-cause and independent failure are
+    alternative ways to end up unavailable, not mutually exclusive."""
     draws = []
     sampled_cols = {}
     for name, spec in uncertain_params.items():
@@ -353,19 +420,38 @@ def default_inner_sampler(rng: np.random.Generator, n_inner: int,
     h0_shift = rng.normal(0.0, h0_sigma, n_inner) if h0_sigma > 0 else np.zeros(n_inner)
     area_scale = _lognormal_cv(rng, area_cv, n_inner)
 
-    gates = list(gate_availability["gates"]) if gate_availability else []
-    p_fail = gate_availability.get("p_fail", 0.0) if gate_availability else 0.0
-    # n_inner x n_gates independent Bernoulli(p_fail) trials, drawn
-    # once here (vectorized, same as every other inner-loop quantity)
-    # rather than per-draw in the caller's loop.
-    gate_fail_draws = (rng.random((n_inner, len(gates))) < p_fail) if gates else None
+    ga = normalize_gate_availability(gate_availability)
+    gates = ga["gates"] if ga else []
+    n_gates = len(gates)
+
+    # Stage 1: independent per-gate draws, each at its own rate.
+    indep_fail = np.zeros((n_inner, n_gates), dtype=bool)
+    for j, g in enumerate(gates):
+        p = ga["p_fail_by_gate"].get(g, 0.0)
+        indep_fail[:, j] = rng.random(n_inner) < p
+
+    # Stage 2: common-cause groups, each its own independent draw;
+    # OR'd onto every gate in that group if it fires. ccf_fires keeps
+    # the per-draw, per-group boolean around for reporting (which CCF
+    # branch actually fired on a given draw), not just the resulting
+    # gate states.
+    ccf_fail = np.zeros((n_inner, n_gates), dtype=bool)
+    ccf_fires: dict[str, np.ndarray] = {}
+    for grp in (ga["ccf_groups"] if ga else []):
+        fires = rng.random(n_inner) < grp["p_ccf"]
+        ccf_fires[grp["label"]] = fires
+        idxs = [j for j, g in enumerate(gates) if g in grp["gates"]]
+        for j in idxs:
+            ccf_fail[:, j] |= fires
+
+    total_fail = indep_fail | ccf_fail
 
     for i in range(n_inner):
         d = {name: float(col[i]) for name, col in sampled_cols.items()}
         d["H0_shift"] = float(h0_shift[i])
         d["area_scale"] = float(area_scale[i])
-        d["gates_failed"] = ([g for g, failed in zip(gates, gate_fail_draws[i]) if failed]
-                              if gates else [])
+        d["gates_failed"] = [gates[j] for j in range(n_gates) if total_fail[i, j]]
+        d["ccf_fired"] = [label for label, fires in ccf_fires.items() if fires[i]]
         draws.append(d)
     return draws
 
@@ -627,7 +713,7 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
                           reservoir_base.H_max)
 
             physical_overrides = {k: v for k, v in inner.items()
-                                   if k not in ("H0_shift", "area_scale", "gates_failed")}
+                                   if k not in ("H0_shift", "area_scale", "gates_failed", "ccf_fired")}
             outlets = call_build_outlets(case_config, rule_overrides,
                                           physical_overrides, scaled_inflow,
                                           gates_out_of_service=inner["gates_failed"])
@@ -651,6 +737,7 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
                 "area_scale": inner["area_scale"],
                 "gates_failed": ",".join(inner["gates_failed"]),
                 "n_gates_failed": len(inner["gates_failed"]),
+                "ccf_fired": ";".join(inner["ccf_fired"]),
                 "peak_level": peak_level,
                 "peak_downstream_release": peak_release,
             }
@@ -728,22 +815,30 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
                 f"reservoir area_scale CV: {meta['area_cv']}\n")
         f.write(f"Inner-loop uncertain physical params: "
                 f"{list(meta['uncertain_params'].keys()) or '(none declared)'}\n")
-        ga = meta.get("gate_availability")
+        ga = normalize_gate_availability(meta.get("gate_availability"))
         if ga:
-            gates, p_fail = list(ga["gates"]), ga.get("p_fail", 0.0)
+            gates = ga["gates"]
             n = len(gates)
+            rates = list(ga["p_fail_by_gate"].values())
             n_failed = np.array([r["n_gates_failed"] for r in records])
             frac_any_failed = float(np.mean(n_failed >= 1))
-            # Closed-form P(K>=1) for n independent Bernoulli(p_fail)
-            # trials -- the same binomial screening model the gate-
-            # availability sampling itself implements -- as a sanity
-            # check that the empirical draws actually reproduce it.
-            expected_any_failed = 1.0 - (1.0 - p_fail) ** n if n else 0.0
-            f.write(f"Gate availability: {n} gates ({', '.join(gates)}), per-gate "
-                    f"failure-to-open probability p_fail={p_fail:.4f} (independent "
-                    f"draws, SAME rate for every gate; common-cause failure NOT modeled)\n")
+            expected_any_failed = expected_p_any_gate_failed(ga["p_fail_by_gate"], ga["ccf_groups"])
+            if len(set(round(r, 6) for r in rates)) <= 1:
+                rate_desc = f"p_fail={rates[0]:.4f} for every gate" if rates else "n/a"
+            else:
+                rate_desc = f"p_fail ranges {min(rates):.4f}-{max(rates):.4f} across gates (per-gate CI-derived rates)"
+            f.write(f"Gate availability: {n} gates ({', '.join(gates)}), {rate_desc}, "
+                    f"independent draws\n")
+            if ga["ccf_groups"]:
+                for grp in ga["ccf_groups"]:
+                    fired = np.array([grp["label"] in r["ccf_fired"].split(";") for r in records])
+                    f.write(f"  Common-cause branch '{grp['label']}' (affects {len(grp['gates'])} "
+                            f"gates): declared p_ccf={grp['p_ccf']:.4f}, empirical fired fraction "
+                            f"over this run: {float(np.mean(fired)):.4f}\n")
+            else:
+                f.write("  Common-cause failure: not modeled (no ccf_groups declared)\n")
             f.write(f"P(>=1 gate failed) -- empirical over this run: {frac_any_failed:.4f}, "
-                    f"closed-form binomial: {expected_any_failed:.4f}\n")
+                    f"closed-form: {expected_any_failed:.4f}\n")
         else:
             f.write("Gate availability: not modeled (no mc_gate_availability() declared)\n")
         f.write("\n")
@@ -759,16 +854,14 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
     print(f"\nWrote {csv_path}")
     print(f"Wrote {plot_path}")
     print(f"Wrote {summary_path}")
-    ga = meta.get("gate_availability")
+    ga = normalize_gate_availability(meta.get("gate_availability"))
     if ga:
         n_failed = np.array([r["n_gates_failed"] for r in records])
-        n_gates = len(ga["gates"])
-        p_fail = ga.get("p_fail", 0.0)
         frac_any_failed = float(np.mean(n_failed >= 1))
-        expected_any_failed = 1.0 - (1.0 - p_fail) ** n_gates if n_gates else 0.0
+        expected_any_failed = expected_p_any_gate_failed(ga["p_fail_by_gate"], ga["ccf_groups"])
         print(f"P(>=1 gate failed) = {frac_any_failed:.4f} "
-              f"(closed-form binomial: {expected_any_failed:.4f}, "
-              f"n={n_gates}, p_fail={p_fail:.4f})")
+              f"(closed-form: {expected_any_failed:.4f}, n={len(ga['gates'])}, "
+              f"{len(ga['ccf_groups'])} CCF group(s))")
     print(f"\nPeak level [m a.s.l.]: P5={p5:.3f}  P50={p50:.3f}  P95={p95:.3f} "
           f"(max_flood_level={meta['max_flood_level']}, dam_crest_level={meta['dam_crest_level']})")
     if meta["max_flood_level"] is not None:

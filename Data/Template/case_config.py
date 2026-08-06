@@ -161,10 +161,8 @@ def build_outlets(rule_overrides: dict | None = None,
                                  # passively OVERTOPPED like a fixed weir
                                  # if the reservoir rises high enough over
                                  # the top of the (immobile) leaf. See the
-                                 # gate_1_stuck_example below for that
-                                 # pattern; Data/Corumana_117_Q5000/
-                                 # case_config.py has a fully worked,
-                                 # active version of it (GATES_OUT_OF_SERVICE).
+                                 # gate_1_stuck_example below for the
+                                 # worked pattern.
     )
 
     # EXAMPLE (inactive by default -- not appended to the returned list
@@ -200,14 +198,12 @@ def build_outlets(rule_overrides: dict | None = None,
     # of WHICH -- split gate_1 into 4 individually-named, independent
     # GatedSpillway instances instead of one bundled n_gates_total=4
     # object. Same physical/rating parameters (they're still identical
-    # gates), just not synchronized into one object -- this is exactly
-    # the pattern Data/Corumana_117_Q5000/case_config.py uses for its
-    # six real gates. Uncomment this block AND remove gate_1 above
-    # from the returned list (don't use both -- that would double-
-    # count the bays) to switch a case over to this pattern; you'll
-    # also need to add a `gates_out_of_service` parameter to this
-    # build_outlets() function, exactly as Data/Corumana_117_Q5000/
-    # case_config.py does (see its own build_outlets() docstring).
+    # gates), just not synchronized into one object. Uncomment this
+    # block AND remove gate_1 above from the returned list (don't use
+    # both -- that would double-count the bays) to switch a case over
+    # to this pattern; you'll also need to add a
+    # `gates_out_of_service` parameter to this build_outlets()
+    # function (see the docstring above for the pattern).
     #
     # GATE_1_BAY_NAMES = ["gate_1a", "gate_1b", "gate_1c", "gate_1d"]
     # gate_1_bays = []
@@ -437,8 +433,11 @@ def mc_uncertain_params():
 # (same opt-in reasoning as mc_outer_distribution() above).
 #
 # Module/mc_layer3.py's inner loop can also model gate-failure-to-open
-# risk, IF a case declares which gates are eligible to fail and a
-# per-gate failure probability:
+# risk. Two ways to populate this hook, both producing the SAME return
+# shape -- mc_layer3.py doesn't know or care which one a case used:
+#
+# TIER 0 -- no condition evidence, just a single judgment-call rate,
+# applied equally to every gate:
 #
 #   def mc_gate_availability():
 #       return {
@@ -446,21 +445,73 @@ def mc_uncertain_params():
 #           "p_fail": 0.05,   # SAME probability applied to EVERY gate
 #       }
 #
-# Each gate's outcome is drawn INDEPENDENTLY every inner draw (the
-# standard binomial screening model P(K=k) = C(n,k)*p^k*(1-p)^(n-k)
-# for the number of gates K that fail to open) -- NOT correlated/
-# common-cause failure, which this simple model does not attempt to
-# capture (a single maintenance lapse taking out several gates AT ONCE
-# would need a different, correlated sampling mechanism, not this one).
+# TIER 1 -- Condition Index (CI) evidence available (an inspection, or
+# a documented engineering judgement with an uncertainty band). Call
+# Module/reliability/gate_reliability.py's build_gate_availability()
+# instead of writing the dict by hand -- it reads per-gate, per-
+# subsystem CI estimates from a components.csv (plus, optionally, a
+# common_cause_events.csv for shared vulnerabilities across gates) and
+# derives a per-gate failure probability, plus any common-cause
+# branches, from them:
+#
+#   from reliability.gate_reliability import build_gate_availability
+#
+#   def mc_gate_availability():
+#       case_dir = os.path.dirname(os.path.abspath(__file__))
+#       return build_gate_availability(
+#           os.path.join(case_dir, "reliability", "components.csv"),
+#           os.path.join(case_dir, "reliability", "common_cause_events.csv"),
+#       )
+#
+# See Data/Template/reliability/*.csv for the illustrative CSV format,
+# and Module/reliability/README.md for the full methodology (what CI
+# means, how it becomes a probability, what's deliberately NOT
+# modeled yet -- dormancy/PSSD, deterioration, Bayesian updating).
+#
+# SWITCHING BETWEEN TIERS AT RUN TIME, without editing this file each
+# time -- useful for a quick side-by-side comparison. Combine both
+# tiers into one function, gated by a module-level flag that reads an
+# environment variable (defaulting to Tier 1 if unset):
+#
+#   USE_CI_RELIABILITY = os.environ.get("USE_CI_RELIABILITY", "true") \
+#       .strip().lower() not in ("0", "false", "no")
+#   TIER0_P_FAIL = float(os.environ.get("GATE_P_FAIL", 0.05))
+#
+#   def mc_gate_availability():
+#       if not USE_CI_RELIABILITY:
+#           return {"gates": ["gate_1a", "gate_1b", "gate_1c", "gate_1d"],
+#                   "p_fail": TIER0_P_FAIL}
+#       case_dir = os.path.dirname(os.path.abspath(__file__))
+#       return build_gate_availability(
+#           os.path.join(case_dir, "reliability", "components.csv"),
+#           os.path.join(case_dir, "reliability", "common_cause_events.csv"),
+#       )
+#
+# Then, from the command line:
+#   uv run python Module/mc_layer3.py <CaseName> ...                        # Tier 1 (default)
+#   USE_CI_RELIABILITY=false uv run python Module/mc_layer3.py <CaseName> ...            # Tier 0, default rate
+#   USE_CI_RELIABILITY=false GATE_P_FAIL=0.10 uv run python Module/mc_layer3.py <CaseName> ...  # Tier 0, custom rate
+#
+# No changes to Module/mc_layer3.py needed for this -- the environment
+# variable is read entirely inside this file's mc_gate_availability(),
+# which mc_layer3.py just calls and consumes the result of, same as
+# always; it never sees USE_CI_RELIABILITY itself.
+#
+# Sampling mechanism (same for both tiers): each gate's outcome is
+# drawn INDEPENDENTLY every inner draw at its own rate; each declared
+# common-cause group (Tier 1 only) is ALSO drawn independently, and if
+# it fires, every gate it names is forced to the failed state for that
+# draw regardless of its own individual outcome -- representing a
+# shared control link, shared component batch/model, or shared power
+# source taking out multiple gates at once, which independent per-gate
+# draws alone can never capture.
 #
 # This only makes sense for a case using INDIVIDUALLY NAMED gates (see
 # the "ALTERNATIVE to the bundled gate_1" block above) -- a case using
 # the bundled n_gates_total form has no individual gate identities for
 # this hook to refer to, and build_outlets() also needs its own
-# `gates_out_of_service` parameter added (see Data/Corumana_117_Q5000/
-# case_config.py for the full worked pattern, including how a gate
-# that's merely stuck closed -- as opposed to fully removed -- can
-# still be modeled as passively overtoppable).
+# `gates_out_of_service` parameter added (see the worked
+# gates_out_of_service example in the docstring above).
 #
 # Without this hook, Layer 3 assumes every gate stays operational for
 # every draw (no failure-to-open risk modeled), and prints a note

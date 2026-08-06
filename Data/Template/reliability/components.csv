@@ -1,0 +1,13 @@
+component_id,gate_id,subsystem,CI_mean,CI_sd,CI_failure,notes
+gate_1a_hydraulic,gate_1a,hydraulic,75,10,25,"ILLUSTRATIVE -- replace with a real CI estimate (inspection evidence or engineering judgement) for your own case"
+gate_1a_structural,gate_1a,structural,80,8,25,"ILLUSTRATIVE"
+gate_1a_control_electrical,gate_1a,control_electrical,75,10,25,"ILLUSTRATIVE"
+gate_1b_hydraulic,gate_1b,hydraulic,75,10,25,"ILLUSTRATIVE"
+gate_1b_structural,gate_1b,structural,80,8,25,"ILLUSTRATIVE"
+gate_1b_control_electrical,gate_1b,control_electrical,75,10,25,"ILLUSTRATIVE"
+gate_1c_hydraulic,gate_1c,hydraulic,75,10,25,"ILLUSTRATIVE"
+gate_1c_structural,gate_1c,structural,80,8,25,"ILLUSTRATIVE"
+gate_1c_control_electrical,gate_1c,control_electrical,75,10,25,"ILLUSTRATIVE"
+gate_1d_hydraulic,gate_1d,hydraulic,75,10,25,"ILLUSTRATIVE"
+gate_1d_structural,gate_1d,structural,80,8,25,"ILLUSTRATIVE"
+gate_1d_control_electrical,gate_1d,control_electrical,75,10,25,"ILLUSTRATIVE"

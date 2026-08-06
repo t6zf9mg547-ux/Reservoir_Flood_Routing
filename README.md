@@ -473,11 +473,12 @@ failure event rather than a continuous physical/rating perturbation --
 whether each of a case's named gates actually opens at all this draw,
 not just how well it performs given that it does.
 
-- **`mc_gate_availability()`** -- declares which gates are eligible to
-  fail and a single per-gate failure probability, applied EQUALLY to
-  every named gate (gate unavailability is modeled as a shared
-  equipment/maintenance-driven rate across identical gates, not
-  per-gate-specific data):
+- **`mc_gate_availability()`** -- can be populated two ways, both
+  producing the SAME dict shape; the inner loop doesn't know or care
+  which one a case used:
+
+  **Simplest form** -- a single, hand-written judgment-call rate,
+  applied EQUALLY to every named gate (no common-cause mechanism):
 
   ```python
   def mc_gate_availability():
@@ -487,13 +488,49 @@ not just how well it performs given that it does.
       }
   ```
 
-  Each inner draw, every listed gate's outcome is drawn INDEPENDENTLY
-  as a Bernoulli(`p_fail`) trial -- the standard binomial screening
-  model `P(K=k) = C(n,k)*p^k*(1-p)^(n-k)` for the number of gates `K`
-  that fail to open, `n = len(gates)`. Common-cause (correlated)
-  failure -- e.g. one maintenance lapse taking out several gates at
-  once -- is explicitly NOT modeled by this independent-draw
-  mechanism.
+  **CI-evidence form** -- derived from real Condition Index evidence
+  (an inspection, or a documented engineering judgement with an
+  uncertainty band) via `Module/reliability/gate_reliability.py`'s
+  `build_gate_availability()`, instead of writing the dict by hand.
+  Reads per-gate, per-subsystem CI estimates from a `components.csv`,
+  combines them through a series fault tree into one failure-on-demand
+  probability per gate, and optionally reads a
+  `common_cause_events.csv` for named, shared-vulnerability branches
+  (a shared control link, a shared component model/batch, a shared
+  power source) that can fail multiple gates at once:
+
+  ```python
+  from reliability.gate_reliability import build_gate_availability
+
+  def mc_gate_availability():
+      case_dir = os.path.dirname(os.path.abspath(__file__))
+      return build_gate_availability(
+          os.path.join(case_dir, "reliability", "components.csv"),
+          os.path.join(case_dir, "reliability", "common_cause_events.csv"),
+      )
+  ```
+
+  See `Module/reliability/README.md` for the full methodology (what CI
+  means, how a `(CI_mean, CI_sd)` estimate becomes a probability, and
+  what's deliberately not modeled yet -- dormancy/PSSD, deterioration,
+  Bayesian updating), and `Data/Template/reliability/*.csv` for the
+  illustrative input format.
+
+  **Sampling mechanism**, common to both forms -- each inner draw runs
+  a two-stage process:
+  1. Each declared common-cause group (CI-evidence form only) draws
+     its own independent Bernoulli(`p_ccf`) trial; if it fires, every
+     gate named in that group is forced to the failed state for this
+     draw, regardless of that gate's own individual outcome below.
+  2. Every gate is then ALSO drawn independently at its own rate
+     (`p_fail_by_gate[gate]`, which may differ per gate under the
+     CI-evidence form, or be one flat rate under the simplest form).
+
+  A gate's final state for the draw is failed if EITHER stage says so.
+  When there are no common-cause groups, this reduces exactly to the
+  original independent-per-gate binomial mechanism
+  (`P(K=k) = C(n,k)*p^k*(1-p)^(n-k)` for the number of gates `K` that
+  fail to open, `n = len(gates)`).
 
   Only makes sense for a case whose gates are modeled as
   INDIVIDUALLY NAMED outlet instances (see "Multiple identical
@@ -503,11 +540,11 @@ not just how well it performs given that it does.
   also needs a `gates_out_of_service` parameter (a list of gate names
   to force out of service for one call, overriding whatever a case's
   own module-level "out of service" list defaults to for a normal
-  run) -- see `Data/Corumana_117_Q5000/case_config.py` for the full
-  worked pattern, including how a gate that's merely stuck closed
-  (rather than fully removed) can still be modeled as passively
-  overtoppable via `on_off`/a substitute `FreeOverflowSpillway`, not
-  simply zero discharge.
+  run) -- see `Data/Template/case_config.py`'s commented worked
+  `gates_out_of_service` example for the pattern, including how a
+  gate that's merely stuck closed (rather than fully removed) can
+  still be modeled as passively overtoppable via `on_off`/a substitute
+  `FreeOverflowSpillway`, not simply zero discharge.
 
   Without this hook, Layer 3 assumes every gate stays operational for
   every draw, and prints a note saying so -- same "not every case
@@ -516,18 +553,18 @@ not just how well it performs given that it does.
 **Output**, mirroring Layer 1/2's own conventions:
 - `Output/<CaseName>/MonteCarlo/mc_results.csv` -- one row per draw,
   every sampled parameter plus its outcome metrics (including
-  `gates_failed` and `n_gates_failed`, present -- possibly always
-  empty/zero -- regardless of whether the case declares
+  `gates_failed`, `n_gates_failed`, and `ccf_fired` -- present,
+  possibly always empty/zero, regardless of whether the case declares
   `mc_gate_availability()`, so the column layout stays consistent
   across cases)
 - `Output/<CaseName>/MonteCarlo/mc_summary.txt` -- headline percentiles,
   exceedance probabilities, exactly which sampling settings were used
   (generic placeholder vs. case-provided real data, for all three
-  hooks), and -- if `mc_gate_availability()` is declared -- the
-  empirical `P(>=1 gate failed)` across the run alongside the
-  closed-form binomial value, as a sanity check that the independent
-  per-gate draws are behaving as the declared `p_fail`/gate count
-  would predict
+  hooks), and -- if `mc_gate_availability()` is declared -- each named
+  common-cause branch's declared probability and empirical fired
+  fraction over the run, alongside the empirical-vs-closed-form
+  `P(>=1 gate failed)` sanity check (generalized to handle per-gate
+  rates and common-cause groups, not just one flat rate)
 - `Plot/<CaseName>/MonteCarlo/mc_distribution.png` -- a histogram of
   peak levels pooled across all draws, alongside an exceedance curve
   (worst-to-best ranking) with each outer draw's own curve shown as a
