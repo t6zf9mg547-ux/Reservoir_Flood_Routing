@@ -93,6 +93,7 @@ import inspect
 import os
 import sys
 import importlib.util
+from statistics import NormalDist
 
 import numpy as np
 
@@ -108,6 +109,7 @@ from reservoir import Reservoir
 from hydrograph import Hydrograph
 from solver import run_simulation
 from report import write_mc_results_csv, write_mc_distribution_plot
+from reliability.importance import rank_importance, format_importance_table
 
 # Reuse Layer 2's case loader + downstream-release/exceedance-time
 # definitions rather than re-implementing them -- same conventions,
@@ -349,11 +351,14 @@ def normalize_gate_availability(gate_availability: dict | None) -> dict | None:
     if "p_fail_by_gate" in gate_availability:
         p_fail_by_gate = dict(gate_availability["p_fail_by_gate"])
         ccf_groups = list(gate_availability.get("ccf_groups", []))
+        component_pfs = gate_availability.get("component_pfs")  # None for Tier 0 / flat form
     else:
         flat_p = gate_availability.get("p_fail", 0.0)
         p_fail_by_gate = {g: flat_p for g in gates}
         ccf_groups = []
-    return {"gates": gates, "p_fail_by_gate": p_fail_by_gate, "ccf_groups": ccf_groups}
+        component_pfs = None
+    return {"gates": gates, "p_fail_by_gate": p_fail_by_gate, "ccf_groups": ccf_groups,
+            "component_pfs": component_pfs}
 
 
 def expected_p_any_gate_failed(p_fail_by_gate: dict[str, float], ccf_groups: list[dict]) -> float:
@@ -766,6 +771,7 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
         "h0_sigma": h0_sigma, "area_cv": area_cv, "rule": rule,
         "uncertain_params": uncertain_params,
         "gate_availability": gate_availability,
+        "seed": seed,
     }
     return records, meta
 
@@ -773,6 +779,63 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
 # ---------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------
+
+def _min_realizations_mean(sigma: float, mu: float, epsilon: float = 0.01, alpha: float = 0.95) -> float:
+    """RMC-TotalRisk Technical Reference Manual, Equation 176: minimum
+    Monte Carlo realizations for the OUTPUT MEAN to be precise to
+    within relative error `epsilon` (e.g. 0.01 = 1%) at confidence
+    `alpha`. sigma/mu are the output's own standard deviation/mean --
+    NOT case inputs. Verified against the manual's own worked example
+    (sigma=15, mu=100, epsilon=0.01, alpha=0.95 -> ~865)."""
+    z = NormalDist().inv_cdf((1 + alpha) / 2)
+    if mu == 0:
+        return float("inf")
+    return ((sigma / (epsilon * abs(mu))) * z) ** 2
+
+
+def _min_realizations_percentile(p: float, dp: float = 0.01, alpha: float = 0.95) -> float:
+    """RMC-TotalRisk Technical Reference Manual, Equation 177: minimum
+    Monte Carlo realizations for the p-th percentile (e.g. p=0.95) to
+    be estimated within tolerance `dp` (in probability units, e.g.
+    0.01) at confidence `alpha`. Verified against the manual's own
+    worked example (p=0.95, dp=0.01, alpha=0.95 -> ~1825)."""
+    z = NormalDist().inv_cdf((1 + alpha) / 2)
+    return p * (1 - p) * (z / dp) ** 2
+
+
+def _bootstrap_percentile_se(data: np.ndarray, percentiles: list[float],
+                              n_boot: int = 500, seed: int = 0) -> dict[float, float]:
+    """Bootstrap standard error for each of `percentiles` (e.g.
+    [5, 50, 95]), via n_boot resamples of `data` WITH replacement,
+    vectorized (one (n_boot x len(data)) index array, not a Python
+    loop). No simple closed form exists for a percentile's SE in
+    general, unlike a probability estimate's (which uses the exact
+    binomial sqrt(p*(1-p)/N) formula instead, computed inline where
+    needed -- bootstrap is reserved for percentiles specifically."""
+    rng = np.random.default_rng(seed)
+    n = len(data)
+    idx = rng.integers(0, n, size=(n_boot, n))
+    boot_samples = data[idx]
+    boot_pctl = np.percentile(boot_samples, percentiles, axis=1)  # shape (len(percentiles), n_boot)
+    return {p: float(np.std(boot_pctl[i], ddof=1)) for i, p in enumerate(percentiles)}
+
+
+
+def _format_exceedance(frac: float, n_total: int) -> str:
+    """Formats an exceedance-probability estimate with either its
+    closed-form binomial standard error (SE = sqrt(p(1-p)/N)), or, if
+    ZERO events were observed in this run, the standard ~3/N upper-
+    bound caveat instead of a bare '0.0000' -- a bare zero reads as
+    'impossible', which it isn't; a rare event can easily produce zero
+    observed occurrences in a finite run without the true probability
+    being zero."""
+    if frac == 0.0:
+        bound = 3.0 / n_total
+        return (f"0.0000 (0 of {n_total} draws -- true probability bounded above by "
+                 f"roughly 3/N ~= {bound:.4f}, NOT zero)")
+    se = (frac * (1 - frac) / n_total) ** 0.5
+    return f"{frac:.4f} (SE~={se:.4f}, binomial approx)"
+
 
 def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None:
     peak_levels = np.array([r["peak_level"] for r in records])
@@ -797,10 +860,21 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
     )
 
     p5, p50, p95 = np.percentile(peak_levels, [5, 50, 95])
+    n_total = n_outer * n_inner
+    mean_level = float(np.mean(peak_levels))
+    std_level = float(np.std(peak_levels, ddof=1))
+    se_mean = std_level / np.sqrt(n_total)  # closed-form SEM
+    pctl_se = _bootstrap_percentile_se(peak_levels, [5, 50, 95])
+    # Eq. 176/177 (RMC-TotalRisk manual) convergence checks -- see the
+    # two helper functions' docstrings for the verified formulas and
+    # the manual's own worked examples they were checked against.
+    n_min_mean = _min_realizations_mean(std_level, mean_level)
+    n_min_p95 = _min_realizations_percentile(0.95)
     summary_path = os.path.join(mc_dir, "mc_summary.txt")
     with open(summary_path, "w") as f:
         f.write(f"Case: {case_name}\n")
         f.write(f"Rule tested: {meta['rule']}\n")
+        f.write(f"Seed: {meta.get('seed')}\n")
         f.write(f"Draws: {n_outer} outer x {n_inner} inner = {n_outer * n_inner}\n")
         f.write(f"Outer-loop source (peak): {meta['outer_source']}\n")
         if meta["target_return_period"] is not None:
@@ -839,17 +913,34 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
                 f.write("  Common-cause failure: not modeled (no ccf_groups declared)\n")
             f.write(f"P(>=1 gate failed) -- empirical over this run: {frac_any_failed:.4f}, "
                     f"closed-form: {expected_any_failed:.4f}\n")
+            if ga.get("component_pfs"):
+                f.write("\nImportance ranking (which subsystem/common-cause branch is "
+                        "carrying the most probability weight -- see Module/reliability/"
+                        "importance.py's docstring for what this ranking does and does not "
+                        "mean; it is a first-pass ranking, not a rigorous sensitivity measure):\n")
+                ranked = rank_importance(ga["component_pfs"], ga["ccf_groups"])
+                f.write(format_importance_table(ranked) + "\n")
         else:
             f.write("Gate availability: not modeled (no mc_gate_availability() declared)\n")
         f.write("\n")
-        f.write(f"Peak level [m a.s.l.]: P5={p5:.3f}  P50={p50:.3f}  P95={p95:.3f}  "
+        f.write(f"Peak level [m a.s.l.]: P5={p5:.3f} (SE~={pctl_se[5]:.3f})  "
+                f"P50={p50:.3f} (SE~={pctl_se[50]:.3f})  P95={p95:.3f} (SE~={pctl_se[95]:.3f})  "
+                f"mean={mean_level:.3f} (SE~={se_mean:.3f})  "
                 f"max={peak_levels.max():.3f}  min={peak_levels.min():.3f}\n")
+        f.write(f"Convergence (RMC-TotalRisk manual Eq. 176/177, target: mean within +/-1%, "
+                f"P95 within +/-0.01, both at 95% confidence): "
+                f"mean needs >={n_min_mean:.0f} realizations (this run: {n_total}, "
+                f"{n_total / n_min_mean:.1f}x margin); "
+                f"P95 needs >={n_min_p95:.0f} realizations (this run: {n_total}, "
+                f"{n_total / n_min_p95:.1f}x margin)\n")
         if meta["max_flood_level"] is not None:
             frac = float(np.mean(peak_levels > meta["max_flood_level"]))
-            f.write(f"P(peak level > max_flood_level={meta['max_flood_level']}): {frac:.4f}\n")
+            f.write(f"P(peak level > max_flood_level={meta['max_flood_level']}): "
+                    f"{_format_exceedance(frac, n_total)}\n")
         if meta["dam_crest_level"] is not None:
             frac = float(np.mean(peak_levels > meta["dam_crest_level"]))
-            f.write(f"P(peak level > dam_crest_level={meta['dam_crest_level']}): {frac:.4f}\n")
+            f.write(f"P(peak level > dam_crest_level={meta['dam_crest_level']}): "
+                    f"{_format_exceedance(frac, n_total)}\n")
 
     print(f"\nWrote {csv_path}")
     print(f"Wrote {plot_path}")
@@ -862,14 +953,22 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
         print(f"P(>=1 gate failed) = {frac_any_failed:.4f} "
               f"(closed-form: {expected_any_failed:.4f}, n={len(ga['gates'])}, "
               f"{len(ga['ccf_groups'])} CCF group(s))")
-    print(f"\nPeak level [m a.s.l.]: P5={p5:.3f}  P50={p50:.3f}  P95={p95:.3f} "
+        if ga.get("component_pfs"):
+            print("\nImportance ranking:")
+            print(format_importance_table(rank_importance(ga["component_pfs"], ga["ccf_groups"])))
+    print(f"\nPeak level [m a.s.l.]: P5={p5:.3f} (SE~={pctl_se[5]:.3f})  "
+          f"P50={p50:.3f} (SE~={pctl_se[50]:.3f})  P95={p95:.3f} (SE~={pctl_se[95]:.3f})  "
+          f"mean={mean_level:.3f} (SE~={se_mean:.3f}) "
           f"(max_flood_level={meta['max_flood_level']}, dam_crest_level={meta['dam_crest_level']})")
+    print(f"Convergence (Eq. 176/177): mean needs >={n_min_mean:.0f} realizations "
+          f"({n_total / n_min_mean:.1f}x margin); P95 needs >={n_min_p95:.0f} realizations "
+          f"({n_total / n_min_p95:.1f}x margin)")
     if meta["max_flood_level"] is not None:
         frac = float(np.mean(peak_levels > meta["max_flood_level"]))
-        print(f"P(exceeds max_flood_level) = {frac:.4f}")
+        print(f"P(exceeds max_flood_level) = {_format_exceedance(frac, n_total)}")
     if meta["dam_crest_level"] is not None:
         frac = float(np.mean(peak_levels > meta["dam_crest_level"]))
-        print(f"P(exceeds dam_crest_level) = {frac:.4f}")
+        print(f"P(exceeds dam_crest_level) = {_format_exceedance(frac, n_total)}")
 
 
 # ---------------------------------------------------------------------

@@ -77,18 +77,27 @@ def compute_gate_pfods(components_csv: str) -> tuple[dict[str, float], dict[str,
 def build_gate_availability(components_csv: str, common_cause_csv: str | None = None) -> dict:
     """Assembles the complete dict a case's mc_gate_availability() hook
     should return: {"gates": [...], "p_fail_by_gate": {...},
-    "ccf_groups": [...]}.
+    "ccf_groups": [...], "component_pfs": {...}}.
 
     components_csv is required. common_cause_csv is optional -- if
     None, or if the file doesn't exist, ccf_groups is simply empty
     (no common-cause mechanism modeled, same as a case that has no
     documented shared vulnerability).
+
+    component_pfs (the per-gate, per-subsystem breakdown
+    compute_gate_pfods() already computes on the way to p_fail_by_gate)
+    is included so callers -- e.g. Module/mc_layer3.py's importance-
+    ranking output -- can show WHICH subsystem is driving each gate's
+    P_FOD, not just the combined number. Purely additive: a caller
+    that only reads "gates"/"p_fail_by_gate"/"ccf_groups" (e.g. the
+    flat Tier-0 form, which has no component_pfs at all) is unaffected.
     """
-    p_fail_by_gate, _ = compute_gate_pfods(components_csv)
+    p_fail_by_gate, component_pfs = compute_gate_pfods(components_csv)
     gates = list(p_fail_by_gate.keys())
     ccf_groups = load_ccf_groups(common_cause_csv, gates) if common_cause_csv else []
     return {
         "gates": gates,
         "p_fail_by_gate": p_fail_by_gate,
         "ccf_groups": ccf_groups,
+        "component_pfs": component_pfs,
     }

@@ -594,14 +594,31 @@ not just how well it performs given that it does.
   possibly always empty/zero, regardless of whether the case declares
   `mc_gate_availability()`, so the column layout stays consistent
   across cases)
-- `Output/<CaseName>/MonteCarlo/mc_summary.txt` -- headline percentiles,
-  exceedance probabilities, exactly which sampling settings were used
+- `Output/<CaseName>/MonteCarlo/mc_summary.txt` -- headline percentiles
+  (P5/P50/P95/mean, each with a standard error -- bootstrap for the
+  percentiles, closed-form SEM for the mean), exceedance probabilities
+  (with their closed-form binomial standard error, or, if zero events
+  were observed in the run, an explicit "bounded above by roughly
+  3/N, NOT zero" caveat instead of a bare `0.0000` -- a rare event
+  producing zero observed occurrences in a finite run doesn't mean the
+  true probability is zero), exactly which sampling settings were used
   (generic placeholder vs. case-provided real data, for all three
-  hooks), and -- if `mc_gate_availability()` is declared -- each named
-  common-cause branch's declared probability and empirical fired
-  fraction over the run, alongside the empirical-vs-closed-form
-  `P(>=1 gate failed)` sanity check (generalized to handle per-gate
-  rates and common-cause groups, not just one flat rate)
+  hooks), the run's `--seed`, and -- if `mc_gate_availability()` is
+  declared -- each named common-cause branch's declared probability
+  and empirical fired fraction over the run, the empirical-vs-closed-
+  form `P(>=1 gate failed)` sanity check, and, for the CI-evidence
+  form specifically, an importance ranking (which subsystem type or
+  common-cause branch is carrying the most probability weight -- see
+  `Module/reliability/importance.py`'s docstring for what this
+  ranking does and doesn't mean).
+- Convergence check, alongside the above: minimum-realizations
+  thresholds for the reported mean and P95, per the USACE RMC-
+  TotalRisk Technical Reference Manual's Equations 176/177, compared
+  against this run's actual draw count as a margin (e.g. "P95 needs
+  >=1825 realizations -- this run: 15000, 8.2x margin"). A margin
+  below 1x is a real, actionable flag that random sampling noise
+  alone could shift the reported value beyond the stated tolerance,
+  not just a theoretical caveat.
 - `Plot/<CaseName>/MonteCarlo/mc_distribution.png` -- a histogram of
   peak levels pooled across all draws, alongside an exceedance curve
   (worst-to-best ranking) with each outer draw's own curve shown as a
