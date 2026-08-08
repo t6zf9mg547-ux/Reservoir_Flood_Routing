@@ -1,8 +1,16 @@
-name,value,unit
-t_max,172800,s
-dt,300,s
-print_every,12,steps
-H0,97.0,m_asl
-dam_crest_level,104.0,m_asl
-max_flood_level,102.5,m_asl
-downstream_threshold_m3s,100,m3/s
+name,value,unit,options
+t_max,432000,s,
+dt,300,s,
+print_every,12,steps,
+H0,100,m_asl,
+dam_crest_level,105,m_asl,
+max_flood_level,104,m_asl,
+downstream_threshold_m3s,500,m3/s,
+mc_h0_sigma,0.1,m,optional; default H0_DEFAULT_SIGMA if row omitted
+mc_area_cv,0.05,-,optional; default AREA_DEFAULT_CV if row omitted
+mc_outer_peak_source,user,-,"REQUIRED. Median is ALWAYS this case's own inflow_hydrograph.csv peak (except bootstrap). curve=needs curve_csv+alt_studies_csv files, CV only, from inter-study spread | bootstrap=needs bootstrap_ci_csv file, MEDIAN AND CV both come from this file, deliberately different from the hydrograph (stress-test case) | user=no file, CV from mc_outer_peak_cv below"
+mc_outer_peak_cv,0.15,-,required if mc_outer_peak_source=user; optional override if =curve/=bootstrap
+mc_outer_volume_source,user,-,"REQUIRED. Median is ALWAYS this case's own inflow_hydrograph.csv volume. table=needs volume_duration_csv file, CV only, self-sufficient (spread comes from the table's own multiple return-period rows) | user=no file, CV from mc_outer_volume_cv below"
+mc_outer_volume_cv,0.15,-,required if mc_outer_volume_source=user; optional override if =table
+mc_gate_reliability_source,flat,-,"REQUIRED (only if mc_gate_availability() is defined in case_config.py). ci=needs reliability/components.csv file (condition-index evidence) | flat=no file, uses mc_gate_p_fail below"
+mc_gate_p_fail,0.05,-,required if mc_gate_reliability_source=flat; unused if =ci

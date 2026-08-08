@@ -387,76 +387,162 @@ def mc_uncertain_params():
 #
 # Module/mc_layer3.py's OUTER loop (climate/flood-frequency uncertainty)
 # can use a case's own real flood-frequency and design-hydrograph data
-# instead of a generic placeholder spread, if the case provides it via
-# an mc_outer_distribution() function returning a dict like:
+# to set the PEAK/VOLUME scale factors' CV (spread). WHICH source
+# drives each loop is an EXPLICIT, MANDATORY choice made in this case's
+# own scalars.csv -- see the two rows below, which every case's
+# scalars.csv must set (Module/mc_layer3.py's validate_mc_sources()
+# hard-errors, before any simulation runs, if either is missing or set
+# to a value the chosen source doesn't need):
+#
+#   name,value,unit
+#   mc_outer_peak_source,curve,-      # one of: curve | bootstrap | user
+#   mc_outer_volume_source,table,-    # one of: table | user
+#
+# IMPORTANT -- what "median" means here: this case's own
+# inflow_hydrograph.csv IS the design hydrograph -- its peak and volume
+# ARE the target-return-period median (median_scale = 1.0), for EVERY
+# source except "bootstrap". curve_csv/alt_studies_csv and
+# volume_duration_csv are CV-ONLY inputs -- they inform the SPREAD
+# around this case's own hydrograph, they never recompute or shift the
+# central value away from it. "bootstrap" is the one deliberate
+# exception: an FFA stress-test case's whole point is that the FFA
+# tool's own median is a genuinely different, disputed central estimate
+# (see chat/FFA_Integration.md), not a refinement of the hydrograph's --
+# so mc_outer_peak_source="bootstrap" DOES move the median, to the
+# bootstrap file's own value at the target return period.
+#
+# mc_outer_peak_source values:
+#   "curve"       -- median: this case's own inflow_hydrograph.csv,
+#                    unchanged. Spread (CV): from alt_studies_csv --
+#                    REQUIRED alongside curve_csv when this source is
+#                    selected (curve_csv alone is a single value per
+#                    return period with no spread information in it;
+#                    alt_studies_csv, 2+ independent past studies
+#                    compared against the adopted curve, is what
+#                    actually supplies the CV). If you don't have a
+#                    second study, use "user" instead of silently
+#                    getting an unlabeled generic default.
+#   "bootstrap"   -- median AND spread BOTH from a real FFA tool's
+#                    bootstrap confidence interval, via
+#                    mc_outer_distribution()'s "bootstrap_ci_csv" key
+#                    (below) -- the median here DELIBERATELY differs
+#                    from this case's own hydrograph peak; that
+#                    disagreement is the entire reason this source
+#                    exists. Almost always used for a dedicated
+#                    STRESS-TEST case, not the primary case -- see
+#                    chat/FFA_Integration.md for the full reasoning:
+#                    when a short record's own FFA bootstrap disagrees
+#                    sharply with an adopted design curve, the honest
+#                    answer is running BOTH as separate, clearly-
+#                    labeled cases side by side, not picking a winner
+#                    or blending them into one number.
+#   "user"        -- no curve data used at all; median = this case's
+#                    own inflow_hydrograph.csv (same as "curve"),
+#                    spread = mc_outer_peak_cv (required in scalars.csv
+#                    when this source is selected) as a pure
+#                    engineering-judgment number, no file needed.
+#
+# mc_outer_distribution() itself, when mc_outer_peak_source is "curve"
+# or "bootstrap" (or mc_outer_volume_source is "table"), returns:
 #
 #   def mc_outer_distribution():
 #       case_dir = os.path.dirname(os.path.abspath(__file__))
 #       return {
-#           "target_return_period": 5000,  # which flood this case represents
+#           "target_return_period": 5000,  # required only for "bootstrap"
+#                                           # (curve/table no longer need
+#                                           # it -- they're CV-only, no
+#                                           # anchor lookup at a specific T)
 #           "curve_csv": os.path.join(case_dir, "flood_frequency_curve.csv"),
 #           "alt_studies_csv": os.path.join(case_dir, "flood_frequency_alt_studies.csv"),
 #           "volume_duration_csv": os.path.join(case_dir, "flood_duration_volume_table.csv"),
+#           # "bootstrap_ci_csv": os.path.join(case_dir, "bootstrap_ci_lognormal.csv"),
+#           # "bootstrap_ci_confidence": 0.95,  # optional, defaults to 0.95
 #       }
 #
 # where:
 #   flood_frequency_curve.csv       : return_period_years,peak_Q_m3s[,source]
-#       -- your adopted design flood-frequency curve (statistical fit
-#       or otherwise). Sets the outer loop's PEAK scale factor's median.
+#       -- your adopted design flood-frequency curve. Used only as the
+#       comparison reference for alt_studies_csv below (interpolated at
+#       each alt study's own return period) -- it does NOT set the
+#       outer loop's median; that stays this case's own hydrograph.
 #   flood_frequency_alt_studies.csv : return_period_years,study,peak_Q_m3s
 #       -- independent past estimates of the same flood(s), if you have
-#       more than one hydrology study for this structure. The spread
-#       between them and your adopted curve sets the PEAK scale
-#       factor's uncertainty (CV) -- a real, if rough, data-grounded
-#       number instead of an assumed one. Needs 2+ rows to be used;
-#       otherwise Layer 3 falls back to a generic placeholder CV.
+#       more than one hydrology study for this structure. REQUIRED
+#       alongside curve_csv when mc_outer_peak_source="curve" -- the
+#       spread between them and your adopted curve is what sets the
+#       PEAK scale factor's CV, a real, if rough, data-grounded number.
+#       Needs 2+ rows; fewer than that is a hard error (see "curve"
+#       above), not a silent fallback.
+#   bootstrap_ci_<distribution>.csv : T,lower,median,upper
+#       -- an FFA tool's bootstrap confidence interval (or model-
+#       averaged quantiles in the same shape) for the fitted peak-flow
+#       distribution, at whichever T values the FFA tool was run for.
+#       Used when mc_outer_peak_source="bootstrap": BOTH the PEAK
+#       scale factor's median (this file's own "median" column at
+#       target_return_period -- the one case where the median genuinely
+#       moves away from this case's own hydrograph) AND its spread
+#       (from the (lower, upper) width, converted to an equivalent
+#       lognormal CV at the stated bootstrap_ci_confidence -- see
+#       Module/mc_layer3.py's derive_outer_cv_from_bootstrap_ci()).
 #   volume_duration_csv : return_period_years,storm_duration_hours,peak_Q_m3s,volume_Mm3
 #       -- your adopted design hydrographs' PAIRED peak and volume by
-#       return period. Sets the outer loop's VOLUME scale factor
-#       (median AND uncertainty), sampled INDEPENDENTLY of the peak
-#       scale factor -- flood volume, not just peak, is often a
-#       first-order control on the routed reservoir level for any
-#       reservoir that provides meaningful attenuation, and assuming
-#       peak and volume always move together (the alternative, if this
-#       hook is absent) can hide the routing-sensitive scenarios that
-#       matter most.
+#       return period. Used when mc_outer_volume_source="table":
+#       SELF-SUFFICIENT for the VOLUME scale factor's CV (its own
+#       multiple return-period rows already carry the spread signal --
+#       unlike curve_csv, no companion "alt studies" file is needed).
+#       Median stays this case's own hydrograph volume, unchanged, same
+#       "CV-only" rule as the peak loop's "curve" source. Sampled
+#       INDEPENDENTLY of the peak scale factor -- flood volume, not
+#       just peak, is often a first-order control on the routed
+#       reservoir level for any reservoir that provides meaningful
+#       attenuation, and assuming peak and volume always move together
+#       (mc_outer_volume_source="user", the alternative) can hide the
+#       routing-sensitive scenarios that matter most.
 #
-# Without this hook, Layer 3 still runs correctly -- it just samples
-# peak and volume scale factors from a generic placeholder log-normal
-# spread (median 1.0, a flat assumed CV) around this case's own
-# inflow_hydrograph.csv, and prints a note saying so. Add the three
-# CSVs above (real data for your own case) and this function once you
-# have them.
+# A STRESS-TEST case built from FFA bootstrap output (per
+# chat/FFA_Integration.md) typically sets ONLY mc_outer_peak_source=
+# "bootstrap" + bootstrap_ci_csv -- and, deliberately, leaves
+# mc_outer_volume_source exactly as the PRIMARY case has it (usually
+# "table", inheriting the SAME volume_duration_csv unchanged), because
+# the FFA bootstrap is peak-only evidence; there is no new information
+# about volume to import, so volume uncertainty should stay exactly as
+# uncertain (or un-uncertain) as it already was in the primary case --
+# not be artificially widened or narrowed on the strength of a change
+# to a completely different quantity.
 
 
-# mc_gate_availability() -- NOT defined for this template, deliberately
-# (same opt-in reasoning as mc_outer_distribution() above).
+# mc_gate_availability(source, p_fail) -- NOT defined for this
+# template, deliberately (same opt-in reasoning as
+# mc_outer_distribution() above). If defined, this case's scalars.csv
+# MUST also set mc_gate_reliability_source (Module/mc_layer3.py's
+# validate_mc_sources() hard-errors otherwise, before any simulation
+# runs) -- there is no default tier; every case picks one explicitly:
 #
-# Module/mc_layer3.py's inner loop can also model gate-failure-to-open
-# risk. Two ways to populate this hook, both producing the SAME return
-# shape -- mc_layer3.py doesn't know or care which one a case used:
+#   name,value,unit
+#   mc_gate_reliability_source,ci,-      # one of: ci | flat
+#   mc_gate_p_fail,0.05,-                # only read/required when source=flat
 #
-# TIER 0 -- no condition evidence, just a single judgment-call rate,
-# applied equally to every gate:
+# mc_layer3.py calls this hook with BOTH arguments every time --
+# source is always one of "ci"/"flat" (already validated), p_fail is
+# the scalars.csv value when source="flat", else None:
 #
-#   def mc_gate_availability():
-#       return {
-#           "gates": ["gate_1a", "gate_1b", "gate_1c", "gate_1d"],
-#           "p_fail": 0.05,   # SAME probability applied to EVERY gate
-#       }
-#
-# TIER 1 -- Condition Index (CI) evidence available (an inspection, or
-# a documented engineering judgement with an uncertainty band). Call
-# Module/reliability/gate_reliability.py's build_gate_availability()
-# instead of writing the dict by hand -- it reads per-gate, per-
-# subsystem CI estimates from a components.csv (plus, optionally, a
-# common_cause_events.csv for shared vulnerabilities across gates) and
-# derives a per-gate failure probability, plus any common-cause
-# branches, from them:
-#
-#   from reliability.gate_reliability import build_gate_availability
-#
-#   def mc_gate_availability():
+#   def mc_gate_availability(source: str, p_fail: float | None = None):
+#       gates = ["gate_1a", "gate_1b", "gate_1c", "gate_1d"]
+#       if source == "flat":
+#           # TIER 0 -- no condition evidence, just a single
+#           # judgment-call rate, applied equally to every gate.
+#           return {"gates": gates, "p_fail": p_fail}
+#       # source == "ci" -- TIER 1, Condition Index (CI) evidence
+#       # available (an inspection, or a documented engineering
+#       # judgement with an uncertainty band). Call
+#       # Module/reliability/gate_reliability.py's
+#       # build_gate_availability() instead of writing the dict by
+#       # hand -- it reads per-gate, per-subsystem CI estimates from a
+#       # components.csv (plus, optionally, a common_cause_events.csv
+#       # for shared vulnerabilities across gates) and derives a
+#       # per-gate failure probability, plus any common-cause
+#       # branches, from them:
+#       from reliability.gate_reliability import build_gate_availability
 #       case_dir = os.path.dirname(os.path.abspath(__file__))
 #       return build_gate_availability(
 #           os.path.join(case_dir, "reliability", "components.csv"),
@@ -468,34 +554,18 @@ def mc_uncertain_params():
 # means, how it becomes a probability, what's deliberately NOT
 # modeled yet -- dormancy/PSSD, deterioration, Bayesian updating).
 #
-# SWITCHING BETWEEN TIERS AT RUN TIME, without editing this file each
-# time -- useful for a quick side-by-side comparison. Combine both
-# tiers into one function, gated by a module-level flag that reads an
-# environment variable (defaulting to Tier 1 if unset):
+# SWITCHING TIERS is now just editing scalars.csv's
+# mc_gate_reliability_source (no environment variable, no code
+# change) -- useful for a quick side-by-side comparison:
 #
-#   USE_CI_RELIABILITY = os.environ.get("USE_CI_RELIABILITY", "true") \
-#       .strip().lower() not in ("0", "false", "no")
-#   TIER0_P_FAIL = float(os.environ.get("GATE_P_FAIL", 0.05))
+#   mc_gate_reliability_source,ci,-              # Tier 1
+#   mc_gate_reliability_source,flat,-            # Tier 0, mc_gate_p_fail sets the rate
 #
-#   def mc_gate_availability():
-#       if not USE_CI_RELIABILITY:
-#           return {"gates": ["gate_1a", "gate_1b", "gate_1c", "gate_1d"],
-#                   "p_fail": TIER0_P_FAIL}
-#       case_dir = os.path.dirname(os.path.abspath(__file__))
-#       return build_gate_availability(
-#           os.path.join(case_dir, "reliability", "components.csv"),
-#           os.path.join(case_dir, "reliability", "common_cause_events.csv"),
-#       )
-#
-# Then, from the command line:
-#   uv run python Module/mc_layer3.py <CaseName> ...                        # Tier 1 (default)
-#   USE_CI_RELIABILITY=false uv run python Module/mc_layer3.py <CaseName> ...            # Tier 0, default rate
-#   USE_CI_RELIABILITY=false GATE_P_FAIL=0.10 uv run python Module/mc_layer3.py <CaseName> ...  # Tier 0, custom rate
-#
-# No changes to Module/mc_layer3.py needed for this -- the environment
-# variable is read entirely inside this file's mc_gate_availability(),
-# which mc_layer3.py just calls and consumes the result of, same as
-# always; it never sees USE_CI_RELIABILITY itself.
+# This also means the tier actually used for a given run is now
+# RECORDED in that run's own scalars.csv and echoed into
+# Output/<CaseName>/MonteCarlo/mc_summary.txt -- unlike the old
+# USE_CI_RELIABILITY environment variable, which left no trace in any
+# output file of which tier a past run actually used.
 #
 # Sampling mechanism (same for both tiers): each gate's outcome is
 # drawn INDEPENDENTLY every inner draw at its own rate; each declared
@@ -521,11 +591,26 @@ def mc_uncertain_params():
 def scalars(case_dir: str):
     """Reads scalars.csv into a dict of {name: value}.
     case_dir is this case's own Data/<CaseName>/ folder, passed in by
-    run_case.py."""
+    run_case.py.
+
+    Most rows are numeric (t_max, H0, mc_h0_sigma, ...) and are parsed
+    as float, same as always. A handful of Layer 3 rows are instead
+    explicit TEXT source selections (mc_outer_peak_source,
+    mc_outer_volume_source, mc_gate_reliability_source -- see
+    Module/mc_layer3.py's validate_mc_sources() for the full contract
+    and why these are now mandatory, not inferred) -- for those, a
+    value that doesn't parse as a float is kept as a plain string
+    instead of raising. Every OTHER row is still expected to be
+    numeric; a genuinely malformed numeric row still fails loudly via
+    the ValueError float() raises, exactly as before."""
     import csv
     vals = {}
     scalars_csv = os.path.join(case_dir, "scalars.csv")
     with open(scalars_csv, encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
-            vals[row["name"]] = float(row["value"])
+            raw = row["value"]
+            try:
+                vals[row["name"]] = float(raw)
+            except ValueError:
+                vals[row["name"]] = raw.strip()
     return vals

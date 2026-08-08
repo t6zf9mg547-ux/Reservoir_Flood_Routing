@@ -41,7 +41,11 @@ python Module/validate_against_original.py Template
     offtake, irrigation, compensation flow, or any other outflow that
     doesn't depend on reservoir level)
   - `scalars.csv`: t_max, dt, print_every, H0, and optionally
-    dam_crest_level, max_flood_level (see "Safety thresholds" below)
+    dam_crest_level, max_flood_level (see "Safety thresholds" below).
+    Also where Layer 3's mandatory `mc_outer_peak_source`/
+    `mc_outer_volume_source`/`mc_gate_reliability_source` selections
+    live (see "Layer 3" below) -- required only if you run Layer 3 for
+    this case, irrelevant to Layer 1/2
   - `case_config.py` : the ONE file where you define which outlets
     exist and their parameters/operating rules (see below)
 
@@ -374,21 +378,75 @@ against `max_flood_level`/`dam_crest_level`), peak downstream release,
 time to exceedance of `downstream_threshold_m3s` (if set), and
 exceedance flags.
 
-**Default sampling, before any case-specific data is provided:** both
-`peak_scale` and `volume_scale` are drawn independently from a
-LOG-NORMAL distribution with median 1.0 (i.e. "this case's own
-`inflow_hydrograph.csv` is assumed correct as-is") and a coefficient of
-variation (CV) of 0.15 (`OUTER_DEFAULT_CV` and `VOLUME_DEFAULT_CV` in
-`mc_layer3.py`) -- a flat, generic, ASSUMED spread, not derived from
-any data. Log-normal rather than normal because scale factors are
+**Every case must explicitly declare its sampling sources -- no silent
+default:** unlike earlier versions of this tool, Layer 3 no longer
+falls back to a generic, unlabeled assumed spread when a case doesn't
+provide real data. Every case's `scalars.csv` MUST set
+`mc_outer_peak_source` and `mc_outer_volume_source` explicitly (see
+below); `mc_layer3.py`'s `validate_mc_sources()` hard-errors, before
+any simulation runs, if either is missing, misspelled, or missing the
+data/scalar its chosen value requires. This is deliberate -- a case
+that hasn't decided yet should fail loudly at startup, not run
+silently against an unlabeled generic number.
+
+**What "median" means, and why it's (almost) always locked to 1.0:**
+this case's own `inflow_hydrograph.csv` IS the design hydrograph -- its
+peak and volume already ARE the target-return-period central estimate.
+So `peak_scale`/`volume_scale` are drawn log-normally with median = 1.0
+(this case's own hydrograph, unchanged) for every source EXCEPT
+`mc_outer_peak_source="bootstrap"` -- external curve/table files are
+CV-ONLY inputs; they inform the SPREAD around the hydrograph, they
+never recompute or shift the central value away from it. `"bootstrap"`
+is the one deliberate exception (see below) -- an FFA stress-test
+case's whole point is that the FFA tool's own median is a genuinely
+different, disputed central estimate, not a refinement of the
+hydrograph's. Log-normal rather than normal because scale factors are
 strictly positive and the distribution should be symmetric in relative
 (percentage) terms rather than absolute terms -- a factor of 0.85 and a
 factor of 1.15 are treated as equally likely, not a factor of -0.15 and
-+0.15 on a scale that shouldn't go negative. A case can override just
-the CV, without providing full curve data, via `mc_outer_peak_cv` and
-`mc_outer_volume_cv` scalars in its own `scalars.csv`. Providing a real
-`mc_outer_distribution()` (see below) replaces both the median AND the
-CV with values grounded in that case's own data instead.
++0.15 on a scale that shouldn't go negative.
+
+**`mc_outer_peak_source`** -- one of three values:
+- `"curve"` -- median: this case's own `inflow_hydrograph.csv`,
+  unchanged. Spread (CV): from `alt_studies_csv`, which is REQUIRED
+  alongside `curve_csv` for this source (`curve_csv` alone is a single
+  value per return period with no spread information in it --
+  `alt_studies_csv`, 2+ independent past studies compared against the
+  adopted curve, is what actually supplies the CV). Selecting `"curve"`
+  without a usable `alt_studies_csv` is a hard error, not a silent
+  fallback -- see `Data/Template/case_config.py`'s `mc_outer_distribution()`
+  comments.
+- `"bootstrap"` -- median AND spread BOTH from a real FFA (Flood
+  Frequency Analysis) tool's bootstrap confidence interval (or
+  model-averaged quantiles in the same shape), via
+  `mc_outer_distribution()`'s `bootstrap_ci_csv` key. The median here
+  DELIBERATELY differs from this case's own hydrograph peak -- that
+  disagreement is the entire reason this source exists. Almost always
+  used for a dedicated STRESS-TEST case duplicated from the primary
+  one, not the primary case itself -- see "FFA bootstrap stress-test
+  cases" below.
+- `"user"` -- no file needed at all; median stays this case's own
+  hydrograph peak, spread = `mc_outer_peak_cv` (required in
+  `scalars.csv` when this source is selected) as a pure
+  engineering-judgment number.
+
+**`mc_outer_volume_source`** -- one of two values:
+- `"table"` -- median: this case's own `inflow_hydrograph.csv`,
+  unchanged. Spread (CV): from `volume_duration_csv`, which is
+  SELF-SUFFICIENT for this -- its own multiple return-period rows
+  already carry the spread signal (via the characteristic V/Q duration
+  across rows), unlike `curve_csv`, which needs a companion
+  `alt_studies_csv`.
+- `"user"` -- no file needed; spread = `mc_outer_volume_cv` (required
+  when this source is selected).
+
+**Overriding a derived CV while keeping the real median:** even when
+`mc_outer_peak_source="curve"`/`"bootstrap"` or
+`mc_outer_volume_source="table"`, an explicit `mc_outer_peak_cv`/
+`mc_outer_volume_cv` in `scalars.csv` still overrides the data-derived
+CV (median stays whatever that source dictates) -- i.e. "use the real
+curve/table/bootstrap data, but I want to set the SPREAD myself" is a
+supported combination, not all-or-nothing.
 
 **Why peak and volume are sampled independently:** a single uniform
 scale factor on the whole hydrograph moves peak and volume together,
@@ -403,12 +461,11 @@ independent `peak_scale` and `volume_scale`, achieved by stretching
 the hydrograph's time axis around its own time-to-peak rather than
 just rescaling its magnitude.
 
-**Opting a case into real data, instead of the generic placeholder
-spread:** by default, Layer 3 samples both loops from a generic,
-flat, assumed spread around this case's own data, and prints a note
-saying so -- it still runs correctly with zero extra setup. A case can
-opt into something better-grounded via two optional hooks in its own
-`case_config.py`, mirroring Layer 2's `optimizable_gates()` pattern:
+**Opting a case into real CV data, on top of the mandatory source
+selection above:** `mc_uncertain_params()` and `mc_outer_distribution()`
+are two optional hooks in a case's own `case_config.py`, mirroring
+Layer 2's `optimizable_gates()` pattern, that supply the REAL data
+behind a `"curve"`/`"bootstrap"`/`"table"` source selection:
 
 - **`mc_uncertain_params()`** -- declares which `physical_overrides`
   keys the inner loop may sample (whatever this case's own
@@ -416,36 +473,61 @@ opt into something better-grounded via two optional hooks in its own
   its own docstring for the exact keys), each with a distribution
   (`lognormal_cv` or `normal`). Without it, the inner loop still varies
   H0 and the reservoir curve, just not discharge coefficients.
-- **`mc_outer_distribution()`** -- points at up to three CSVs so the
-  outer loop can be grounded in real flood-frequency data instead of a
-  flat assumed spread:
+- **`mc_outer_distribution()`** -- required whenever `mc_outer_peak_source`
+is `"curve"`/`"bootstrap"`, or `mc_outer_volume_source` is `"table"`
+(not needed at all if both sources are `"user"`). Points at whichever
+of these CSVs the selected sources need:
   - `curve_csv` (`return_period_years,peak_Q_m3s[,source]`) -- your
-    adopted design flood-frequency curve. Sets the peak scale factor's
-    median.
+    adopted design flood-frequency curve. Used only as the comparison
+    reference for `alt_studies_csv` (interpolated at each alt study's
+    own return period) -- it does NOT set the outer loop's median;
+    that stays this case's own hydrograph (see "What 'median' means"
+    above).
   - `alt_studies_csv` (`return_period_years,study,peak_Q_m3s`) --
-    independent past estimates of the same flood(s), if more than one
-    hydrology study exists for this structure. The spread between them
-    and your adopted curve sets the peak scale factor's uncertainty
-    (CV) from real data instead of an assumed number.
+    independent past estimates of the same flood(s). REQUIRED
+    alongside `curve_csv` when `mc_outer_peak_source="curve"` -- the
+    spread between them and your adopted curve is what sets the peak
+    scale factor's CV. Needs 2+ rows; fewer than that is a hard error,
+    not a silent fallback.
+  - `bootstrap_ci_csv` (`T,lower,median,upper`) -- an FFA tool's
+    bootstrap confidence interval (or model-averaged quantiles in the
+    same shape). Required when `mc_outer_peak_source="bootstrap"`:
+    supplies BOTH the peak scale factor's median (this file's own
+    `median` column at `target_return_period`) AND its CV (from the
+    `(lower, upper)` width, converted to an equivalent lognormal CV at
+    an optional `bootstrap_ci_confidence`, default 0.95). See "FFA
+    bootstrap stress-test cases" below.
   - `volume_duration_csv`
     (`return_period_years,storm_duration_hours,peak_Q_m3s,volume_Mm3`)
     -- your adopted design hydrographs' PAIRED peak and volume by
-    return period. Sets the volume scale factor (median AND
-    uncertainty), independently of the peak scale factor.
+    return period. Required when `mc_outer_volume_source="table"`:
+    self-sufficient for the volume scale factor's CV (median stays
+    this case's own hydrograph volume, unchanged).
+  - `target_return_period` -- required only when
+    `mc_outer_peak_source="bootstrap"` (curve/table sources are CV-only
+    and no longer need a specific T to anchor a median lookup at).
 
   See `Data/Template/case_config.py`'s comments for the exact function
   signature and file formats to copy.
 
-  **Overriding the derived spread while keeping the real median:** a
-  case's `scalars.csv` can set `mc_outer_peak_cv`/`mc_outer_volume_cv`
-  explicitly. If `mc_outer_distribution()` is ALSO set and derivation
-  from `alt_studies_csv`/`volume_duration_csv` succeeds, the explicit
-  scalar wins over the derived CV -- i.e. you can use the real
-  curve/table data for the MEDIAN (the actual design-flood anchor)
-  while setting the SPREAD yourself as an engineering-judgment number,
-  rather than it being all-or-nothing. Leave the scalar unset to keep
-  the old behavior (derived CV wins when available, generic default
-  otherwise).
+**FFA bootstrap stress-test cases:** when a real Flood Frequency
+Analysis tool's bootstrap fit to a case's own annual-maximum record
+disagrees sharply with its adopted design curve -- typically because a
+short record is being extrapolated far beyond its length, and the
+FFA tool's own model-averaged-disagreement diagnostics confirm that's
+sample-skew instability rather than new hazard evidence -- the
+recommended approach is NOT to replace the primary case's adopted
+curve. Duplicate the case folder into a second, clearly-labeled
+STRESS-TEST case whose `mc_outer_distribution()` sets
+`mc_outer_peak_source="bootstrap"` + `bootstrap_ci_csv`, and run both
+side by side, reporting both, rather than picking a winner or blending
+them into one number. The stress-test case deliberately leaves
+`mc_outer_volume_source` exactly as the primary case has it (usually
+`"table"`, inheriting the same `volume_duration_csv` unchanged) --
+the FFA bootstrap is peak-only evidence, so volume uncertainty stays
+exactly as uncertain (or un-uncertain) as it already was, rather than
+being artificially widened or narrowed on the strength of a change to
+a completely different quantity.
 
 **Important caveat on `alt_studies_csv`-derived uncertainty:** the
 resulting CV is a measure of how much INDEPENDENT PAST STUDIES of the
@@ -473,19 +555,24 @@ failure event rather than a continuous physical/rating perturbation --
 whether each of a case's named gates actually opens at all this draw,
 not just how well it performs given that it does.
 
-- **`mc_gate_availability()`** -- can be populated two ways, both
-  producing the SAME dict shape; the inner loop doesn't know or care
-  which one a case used:
+- **`mc_gate_availability(source, p_fail=None)`** -- can be populated
+  two ways, both producing the SAME dict shape; the inner loop doesn't
+  know or care which one a case used. `mc_layer3.py` calls this hook
+  with BOTH arguments every time, driven by `scalars.csv`'s
+  `mc_gate_reliability_source` (`"ci"`\|`"flat"`, REQUIRED whenever
+  this hook is defined -- `validate_mc_sources()` hard-errors
+  otherwise) and `mc_gate_p_fail` (required only when
+  `mc_gate_reliability_source="flat"`):
 
   **Simplest form** -- a single, hand-written judgment-call rate,
   applied EQUALLY to every named gate (no common-cause mechanism):
 
   ```python
-  def mc_gate_availability():
-      return {
-          "gates": ["gate_1", "gate_2", "gate_3", "gate_4", "gate_5", "gate_6"],
-          "p_fail": 0.05,   # SAME probability applied to EVERY gate
-      }
+  def mc_gate_availability(source: str, p_fail: float | None = None):
+      gates = ["gate_1", "gate_2", "gate_3", "gate_4", "gate_5", "gate_6"]
+      if source == "flat":
+          return {"gates": gates, "p_fail": p_fail}
+      ...  # source == "ci", see below
   ```
 
   **CI-evidence form** -- derived from real Condition Index evidence
@@ -502,7 +589,10 @@ not just how well it performs given that it does.
   ```python
   from reliability.gate_reliability import build_gate_availability
 
-  def mc_gate_availability():
+  def mc_gate_availability(source: str, p_fail: float | None = None):
+      gates = [...]
+      if source == "flat":
+          return {"gates": gates, "p_fail": p_fail}
       case_dir = os.path.dirname(os.path.abspath(__file__))
       return build_gate_availability(
           os.path.join(case_dir, "reliability", "components.csv"),
@@ -516,42 +606,22 @@ not just how well it performs given that it does.
   Bayesian updating), and `Data/Template/reliability/*.csv` for the
   illustrative input format.
 
-  **Switching between the two forms at run time**, without editing
-  `case_config.py` each time -- useful for a quick side-by-side
-  comparison. Combine both forms into one function, gated by a
-  module-level flag that reads an environment variable (defaulting to
-  the CI-evidence form if unset):
+  **Switching between the two forms** is now just editing
+  `scalars.csv`'s `mc_gate_reliability_source` -- no environment
+  variable, no code change, and unlike the environment variable, the
+  tier actually used for a run is now RECORDED in that run's own
+  `scalars.csv` and echoed into `mc_summary.txt`:
 
-  ```python
-  USE_CI_RELIABILITY = os.environ.get("USE_CI_RELIABILITY", "true") \
-      .strip().lower() not in ("0", "false", "no")
-  TIER0_P_FAIL = float(os.environ.get("GATE_P_FAIL", 0.05))
-
-  def mc_gate_availability():
-      if not USE_CI_RELIABILITY:
-          return {"gates": [...], "p_fail": TIER0_P_FAIL}
-      case_dir = os.path.dirname(os.path.abspath(__file__))
-      return build_gate_availability(
-          os.path.join(case_dir, "reliability", "components.csv"),
-          os.path.join(case_dir, "reliability", "common_cause_events.csv"),
-      )
+  ```
+  mc_gate_reliability_source,ci,-      # CI-evidence form
+  mc_gate_reliability_source,flat,-    # flat rate; mc_gate_p_fail sets the rate
   ```
 
-  Then, from the command line, no code edits needed to switch:
-  ```
-  python Module/mc_layer3.py <CaseName> ...                                    # CI-evidence form (default)
-  USE_CI_RELIABILITY=false python Module/mc_layer3.py <CaseName> ...           # flat rate, default p_fail
-  USE_CI_RELIABILITY=false GATE_P_FAIL=0.10 python Module/mc_layer3.py <CaseName> ...  # flat rate, custom p_fail
-  ```
-
-  `Module/mc_layer3.py` itself never reads either environment variable
-  and has no branching logic for this at all -- the switch lives
-  entirely inside `case_config.py`'s own `mc_gate_availability()`,
-  which `mc_layer3.py` just calls and consumes the result of, same as
-  always. This keeps the same "case-specific choices live in
-  `case_config.py`, the engine stays generic" split used everywhere
-  else in this project -- see `Data/Template/case_config.py`'s
-  commented worked version of this pattern.
+  A case's `mc_gate_availability()` still using the old no-argument
+  signature (from the previous `USE_CI_RELIABILITY`/`GATE_P_FAIL`
+  environment-variable pattern) will raise a clear migration error at
+  startup -- update it to accept `(source, p_fail=None)` as shown
+  above.
 
   **Sampling mechanism**, common to both forms -- each inner draw runs
   a two-stage process:
@@ -601,9 +671,11 @@ not just how well it performs given that it does.
   were observed in the run, an explicit "bounded above by roughly
   3/N, NOT zero" caveat instead of a bare `0.0000` -- a rare event
   producing zero observed occurrences in a finite run doesn't mean the
-  true probability is zero), exactly which sampling settings were used
-  (generic placeholder vs. case-provided real data, for all three
-  hooks), the run's `--seed`, and -- if `mc_gate_availability()` is
+  true probability is zero), exactly which sampling source was
+  declared and used (`mc_outer_peak_source`/`mc_outer_volume_source`/
+  `mc_gate_reliability_source`, all three explicit per-case choices --
+  see "Every case must explicitly declare its sampling sources"
+  above), the run's `--seed`, and -- if `mc_gate_availability()` is
   declared -- each named common-cause branch's declared probability
   and empirical fired fraction over the run, the empirical-vs-closed-
   form `P(>=1 gate failed)` sanity check, and, for the CI-evidence

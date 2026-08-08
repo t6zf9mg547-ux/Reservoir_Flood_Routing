@@ -82,31 +82,55 @@ Writes: `Output/<CaseName>/MonteCarlo/mc_results.csv`,
 `Output/<CaseName>/MonteCarlo/mc_summary.txt`,
 `Plot/<CaseName>/MonteCarlo/mc_distribution.png`.
 
+### Before running Layer 3 for the first time on a case
+
+`scalars.csv` MUST set `mc_outer_peak_source`, `mc_outer_volume_source`,
+and (if `mc_gate_availability()` is defined) `mc_gate_reliability_source`
+explicitly -- the run refuses to start otherwise, with a message naming
+exactly what's missing. See the README's "Layer 3" section and
+`Data/Template/scalars.csv`'s `options` column for the valid values and
+what each one needs.
+
 ### Gate-reliability tier switch
 
-Only relevant for a case whose `case_config.py` implements the
-`USE_CI_RELIABILITY` environment-variable pattern (see
-`Data/Template/case_config.py`'s commented example, and the README's
-"Gate-availability (failure-to-open) risk" section, for how to add it
-to a case that doesn't have it yet).
+Only relevant for a case whose `case_config.py` defines
+`mc_gate_availability()` (see `Data/Template/case_config.py`'s
+commented example, and the README's "Gate-availability (failure-to-
+open) risk" section, for how to add it to a case that doesn't have it
+yet). The switch lives entirely in that case's own `scalars.csv` --
+edit `mc_gate_reliability_source`, no command-line flag or environment
+variable needed:
 
-CI-evidence-based reliability (the default -- no flag needed):
+CI-evidence-based reliability:
+```
+mc_gate_reliability_source,ci,-
+```
 ```bash
 uv run python Module/mc_layer3.py <CaseName> --n-outer 100 --n-inner 150
 ```
 
-Flat rate instead, default `p_fail`:
+Flat rate instead:
+```
+mc_gate_reliability_source,flat,-
+mc_gate_p_fail,0.05,-
+```
 ```bash
-USE_CI_RELIABILITY=false uv run python Module/mc_layer3.py <CaseName> --n-outer 100 --n-inner 150
+uv run python Module/mc_layer3.py <CaseName> --n-outer 100 --n-inner 150
 ```
 
-Flat rate, custom `p_fail`:
+Flat rate, custom `p_fail` -- just change the value in `scalars.csv`:
+```
+mc_gate_reliability_source,flat,-
+mc_gate_p_fail,0.10,-
+```
 ```bash
-USE_CI_RELIABILITY=false GATE_P_FAIL=0.10 uv run python Module/mc_layer3.py <CaseName> --n-outer 100 --n-inner 150
+uv run python Module/mc_layer3.py <CaseName> --n-outer 100 --n-inner 150
 ```
 
-`Module/mc_layer3.py` itself never reads either environment variable --
-the switch lives entirely inside that case's own `case_config.py`.
+`Module/mc_layer3.py` itself never reads an environment variable for
+this -- the switch is entirely a `scalars.csv` value, read via
+`validate_mc_sources()` and passed to that case's own
+`mc_gate_availability(source, p_fail)`.
 
 ## Setup (once, before any of the above)
 

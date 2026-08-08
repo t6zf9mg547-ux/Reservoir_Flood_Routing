@@ -22,9 +22,13 @@ OUTER loop -- "which world are we in": climate/frequency-curve scenario.
     combination of (a) statistical uncertainty in fitting a flood-
     frequency distribution to a finite record and (b) climate-driven
     uncertainty in how that distribution shifts under a future/design
-    horizon. Sampled log-normally, median = 1.0 (the case's own
-    hydrograph IS the central estimate), spread set by
-    `mc_outer_peak_cv` in scalars.csv (default OUTER_DEFAULT_CV below).
+    horizon. Sampled log-normally, median = 1.0 in every case except
+    mc_outer_peak_source="bootstrap" (the case's own hydrograph IS the
+    central estimate; see validate_mc_sources() and the peak/volume
+    source-selection block in run_case_layer3() for the full contract
+    -- every case's scalars.csv MUST explicitly declare
+    mc_outer_peak_source/mc_outer_volume_source, there is no silent
+    default CV anymore).
 
     This is deliberately the SIMPLEST defensible v1 -- a single scale
     factor conflates "how big" uncertainty into one number rather than
@@ -118,13 +122,6 @@ from reliability.importance import rank_importance, format_importance_table
 # pymoo to be installed.
 from optimize_layer2 import load_case_config, downstream_release, time_to_exceedance
 
-OUTER_DEFAULT_CV = 0.15   # default spread on the outer-loop hydrograph
-                          # peak scale factor if scalars.csv doesn't
-                          # set mc_outer_peak_cv
-VOLUME_DEFAULT_CV = 0.15  # default spread on the outer-loop hydrograph
-                          # VOLUME scale factor (independent of peak --
-                          # see ScaledHydrograph) if no real duration/
-                          # volume data is available for a case
 H0_DEFAULT_SIGMA = 0.10   # [m] default antecedent-level uncertainty if
                           # scalars.csv doesn't set mc_h0_sigma
 AREA_DEFAULT_CV = 0.05    # default reservoir stage-storage curve
@@ -155,7 +152,10 @@ class ScaledHydrograph:
     rather than just rescaling one fixed shape. A case can supply real
     data on this via mc_outer_distribution()'s "volume_duration_csv"
     key (see Data/Template/case_config.py's comments for the expected
-    format) -- absent that, a generic placeholder CV is used instead.
+    format), selected explicitly via mc_outer_volume_source='table' in
+    scalars.csv -- every case must declare a volume CV source
+    explicitly (see validate_mc_sources()), there is no silent
+    unlabeled default.
 
     Mechanism: peak_scale multiplies Q(t) directly (sets the peak).
     volume_scale is achieved by stretching/compressing the TIME axis
@@ -299,6 +299,68 @@ def derive_volume_cv_from_duration_table(T: np.ndarray, Q: np.ndarray, V: np.nda
     log_ratios = np.log(ratios / np.median(ratios))
     sigma = float(np.std(log_ratios, ddof=1))
     return float(np.sqrt(np.exp(sigma ** 2) - 1.0))
+
+
+def load_bootstrap_ci_curve(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Reads an FFA tool's bootstrap_ci_<distribution>.csv (or
+    model_averaged_quantiles.csv in the same shape):
+        T,lower,median,upper
+    into sorted (T, lower, median, upper) arrays. `median` is this
+    file's own model-averaged/bootstrap point estimate -- NOT
+    necessarily the same as any curve_csv a case may separately have
+    adopted; when this file is used (mc_outer_peak_source="bootstrap"),
+    its own median is the peak-loop anchor, deliberately not blended
+    with any adopted curve (see FFA_Integration.md, Option D)."""
+    T, lower, median, upper = [], [], [], []
+    with open(path, encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            T.append(float(row["T"]))
+            lower.append(float(row["lower"]))
+            median.append(float(row["median"]))
+            upper.append(float(row["upper"]))
+    order = np.argsort(T)
+    return (np.asarray(T)[order], np.asarray(lower)[order],
+            np.asarray(median)[order], np.asarray(upper)[order])
+
+
+def derive_outer_cv_from_bootstrap_ci(ci_T: np.ndarray, ci_lower: np.ndarray,
+                                       ci_median: np.ndarray, ci_upper: np.ndarray,
+                                       target_return_period: float,
+                                       ci_confidence: float = 0.95) -> tuple[float, float]:
+    """Parallel to derive_outer_cv_from_alt_studies(), but for a real
+    FFA tool's bootstrap confidence interval rather than inter-study
+    disagreement -- see FFA_Integration.md for why these two are kept
+    as separate, non-blended sources (Option C) rather than merged.
+
+    Log-log-interpolates lower/median/upper at target_return_period,
+    then converts the (lower, upper) width around median into an
+    equivalent lognormal CV, using the SAME z-score convention already
+    used elsewhere in this file for confidence-interval math (see
+    _min_realizations_mean/_min_realizations_percentile):
+        z = NormalDist().inv_cdf((1 + ci_confidence) / 2)
+    sigma is estimated from BOTH sides of the interval independently
+    (upper side: ln(upper/median)/z; lower side: -ln(lower/median)/z)
+    and averaged, which is more robust to a mildly asymmetric bootstrap
+    interval than using either side alone.
+
+    Returns (anchor_Q, cv):
+        anchor_Q -- this file's own median at target_return_period,
+                    the peak-loop's median_scale anchor (analogous to
+                    curve_csv's anchor_Q).
+        cv       -- the derived peak-loop coefficient of variation.
+    Raises the same exception types load_flood_frequency_curve() /
+    derive_outer_cv_from_alt_studies() can raise (FileNotFoundError,
+    KeyError, ValueError) on a malformed/missing file, so callers can
+    reuse the same except clause."""
+    anchor_Q = _loglog_interp(target_return_period, ci_T, ci_median)
+    lower_Q = _loglog_interp(target_return_period, ci_T, ci_lower)
+    upper_Q = _loglog_interp(target_return_period, ci_T, ci_upper)
+    z = NormalDist().inv_cdf((1 + ci_confidence) / 2)
+    sigma_upper = np.log(upper_Q / anchor_Q) / z
+    sigma_lower = -np.log(lower_Q / anchor_Q) / z
+    sigma = float((sigma_upper + sigma_lower) / 2.0)
+    cv = float(np.sqrt(np.exp(sigma ** 2) - 1.0))
+    return anchor_Q, cv
 
 
 def default_outer_sampler(rng: np.random.Generator, n_outer: int,
@@ -462,6 +524,117 @@ def default_inner_sampler(rng: np.random.Generator, n_inner: int,
 
 
 # ---------------------------------------------------------------------
+# Explicit-source validation (HARD ERROR by design -- see chat/
+# FFA_Integration.md follow-up: this project deliberately moved away
+# from letting the outer/inner loops infer their own data source from
+# "which CSVs happen to exist", because that made it hard to tell,
+# from a case's files alone, which source was actually in effect. Every
+# case's scalars.csv MUST declare all three source scalars below,
+# explicitly, or the run refuses to start. There is no "auto" mode --
+# an unset/misspelled source scalar is a configuration bug, not a
+# fallback opportunity, and should be caught before any simulation
+# runs, not discovered later from a puzzling mc_summary.txt.
+# ---------------------------------------------------------------------
+
+VALID_PEAK_SOURCES = {"curve", "bootstrap", "user"}
+VALID_VOLUME_SOURCES = {"table", "user"}
+VALID_GATE_SOURCES = {"ci", "flat"}
+
+
+class MCConfigError(ValueError):
+    """Raised when a case's scalars.csv/case_config.py doesn't satisfy
+    the explicit-source contract this file requires. Deliberately a
+    plain ValueError subclass (not caught anywhere downstream) so it
+    surfaces as a hard stop with a clear message, not a silent
+    fallback to a default the case owner never asked for."""
+
+
+def _require_scalar_str(sc: dict, key: str, valid: set[str], case_name: str) -> str:
+    if key not in sc:
+        raise MCConfigError(
+            f"{case_name}/scalars.csv is missing required row '{key}'. "
+            f"Every case must declare this explicitly -- add a row "
+            f"'{key},<value>,-' with <value> one of: {sorted(valid)}. "
+            f"See Data/Template/case_config.py's mc_outer_distribution()/"
+            f"mc_gate_availability() docstrings for what each value means.")
+    val = sc[key]
+    if not isinstance(val, str):
+        # scalars() coerces numeric-looking values to float -- a
+        # source key that parsed as a number is itself a config bug
+        # (e.g. someone left it as a leftover numeric placeholder).
+        raise MCConfigError(
+            f"{case_name}/scalars.csv row '{key}' must be one of the "
+            f"text values {sorted(valid)}, got a number ({val!r}) instead.")
+    val = val.strip().lower()
+    if val not in valid:
+        raise MCConfigError(
+            f"{case_name}/scalars.csv row '{key}' has value '{val}', "
+            f"not one of the recognized values {sorted(valid)}.")
+    return val
+
+
+def validate_mc_sources(sc: dict, outer_dist: dict | None, case_name: str) -> dict:
+    """Validates and returns the three explicit source selections this
+    case has made, cross-checked against what data/scalars they each
+    require. Raises MCConfigError (before any simulation runs) if the
+    declared source and the available data/scalars don't line up --
+    e.g. source='bootstrap' but mc_outer_distribution() has no
+    'bootstrap_ci_csv' key, or source='user' but the corresponding _cv
+    scalar isn't set. Called once per run_case_layer3() call."""
+    peak_source = _require_scalar_str(sc, "mc_outer_peak_source", VALID_PEAK_SOURCES, case_name)
+    volume_source = _require_scalar_str(sc, "mc_outer_volume_source", VALID_VOLUME_SOURCES, case_name)
+    gate_source = _require_scalar_str(sc, "mc_gate_reliability_source", VALID_GATE_SOURCES, case_name)
+
+    def need(key):
+        if key not in sc:
+            raise MCConfigError(
+                f"{case_name}/scalars.csv: mc_outer_peak_source/mc_outer_volume_source "
+                f"selection requires a '{key}' row, which is missing.")
+
+    if peak_source == "user":
+        need("mc_outer_peak_cv")
+    elif peak_source == "curve":
+        if outer_dist is None or "curve_csv" not in outer_dist:
+            raise MCConfigError(
+                f"{case_name}: mc_outer_peak_source='curve' requires "
+                f"mc_outer_distribution() to return a 'curve_csv' key.")
+        if "alt_studies_csv" not in outer_dist:
+            raise MCConfigError(
+                f"{case_name}: mc_outer_peak_source='curve' also requires an "
+                f"'alt_studies_csv' key -- curve_csv alone is a single median "
+                f"value with no spread information in it; alt_studies_csv (2+ "
+                f"independent past studies) is what actually supplies the CV. "
+                f"If you don't have that, use mc_outer_peak_source='user' with "
+                f"an explicit mc_outer_peak_cv instead of an unlabeled generic "
+                f"default.")
+    elif peak_source == "bootstrap":
+        if outer_dist is None or "bootstrap_ci_csv" not in outer_dist:
+            raise MCConfigError(
+                f"{case_name}: mc_outer_peak_source='bootstrap' requires "
+                f"mc_outer_distribution() to return a 'bootstrap_ci_csv' key.")
+        if "target_return_period" not in outer_dist:
+            raise MCConfigError(
+                f"{case_name}: mc_outer_peak_source='bootstrap' requires "
+                f"mc_outer_distribution() to also return a 'target_return_period' "
+                f"key -- which T to read off the bootstrap CI curve.")
+
+    if volume_source == "user":
+        need("mc_outer_volume_cv")
+    elif volume_source == "table":
+        if outer_dist is None or "volume_duration_csv" not in outer_dist:
+            raise MCConfigError(
+                f"{case_name}: mc_outer_volume_source='table' requires "
+                f"mc_outer_distribution() to return a 'volume_duration_csv' key.")
+
+    if gate_source == "flat" and "mc_gate_p_fail" not in sc:
+        raise MCConfigError(
+            f"{case_name}/scalars.csv: mc_gate_reliability_source='flat' "
+            f"requires an 'mc_gate_p_fail' row.")
+
+    return {"peak_source": peak_source, "volume_source": volume_source, "gate_source": gate_source}
+
+
+# ---------------------------------------------------------------------
 # Case setup
 # ---------------------------------------------------------------------
 
@@ -566,13 +739,27 @@ def build_case(case_name: str, rule: str = "baseline"):
         outer_dist = case_config.mc_outer_distribution()
     else:
         print(f"  NOTE: {case_name}/case_config.py has no mc_outer_distribution() -- "
-              "outer loop will use the generic placeholder (a flat CV around this "
-              "case's own hydrograph peak), not a real flood-frequency curve. See "
+              "mc_outer_peak_source/mc_outer_volume_source in scalars.csv must both "
+              "be 'user' for this case (validate_mc_sources() will error otherwise, "
+              "since 'curve'/'bootstrap'/'table' all need this hook). See "
               "Data/Template/case_config.py for the pattern to add it.")
+
+    mc_sources = validate_mc_sources(sc, outer_dist, case_name)
 
     gate_availability = None
     if hasattr(case_config, "mc_gate_availability"):
-        gate_availability = case_config.mc_gate_availability()
+        sig = inspect.signature(case_config.mc_gate_availability)
+        if "source" not in sig.parameters:
+            raise MCConfigError(
+                f"{case_name}/case_config.py's mc_gate_availability() still uses the "
+                f"old USE_CI_RELIABILITY/GATE_P_FAIL env-var pattern -- that switch has "
+                f"moved to scalars.csv's mc_gate_reliability_source/mc_gate_p_fail. "
+                f"Update its signature to mc_gate_availability(source, p_fail=None), "
+                f"selecting Tier 0 (flat) vs Tier 1 (CI-evidence) on the 'source' "
+                f"argument instead of reading an environment variable. See "
+                f"Data/Template/case_config.py for the current pattern.")
+        gate_availability = case_config.mc_gate_availability(
+            mc_sources["gate_source"], sc.get("mc_gate_p_fail"))
     else:
         print(f"  NOTE: {case_name}/case_config.py has no mc_gate_availability() -- "
               "inner loop will assume every gate stays operational (no gate "
@@ -580,7 +767,7 @@ def build_case(case_name: str, rule: str = "baseline"):
               "case_config.py or Data/Template/case_config.py for the pattern to add it.")
 
     return (case_config, case_dir, reservoir_base, inflow_base, withdrawal, sc,
-            rule_overrides, uncertain_params, outer_dist, gate_availability)
+            rule_overrides, uncertain_params, outer_dist, gate_availability, mc_sources)
 
 
 # ---------------------------------------------------------------------
@@ -591,7 +778,7 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
                      rule: str = "baseline") -> tuple[list[dict], dict]:
     (case_config, case_dir, reservoir_base, inflow_base, withdrawal, sc,
      rule_overrides, uncertain_params, outer_dist,
-     gate_availability) = build_case(case_name, rule)
+     gate_availability, mc_sources) = build_case(case_name, rule)
 
     h0_sigma = sc.get("mc_h0_sigma", H0_DEFAULT_SIGMA)
     area_cv = sc.get("mc_area_cv", AREA_DEFAULT_CV)
@@ -602,95 +789,118 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
     t_max, dt = sc["t_max"], sc["dt"]
     print_every = int(sc.get("print_every", 1))
 
-    # A case can set mc_outer_peak_cv/mc_outer_volume_cv in its OWN
-    # scalars.csv as an EXPLICIT judgment call on the spread, distinct
-    # from just leaving it unset (which falls back to either the
-    # generic OUTER_DEFAULT_CV/VOLUME_DEFAULT_CV, or -- if real
-    # alt_studies/duration data is available below -- the data-derived
-    # spread). Captured as None-if-absent here (not yet defaulted) so
-    # the derivation logic below can tell "the case didn't set this"
-    # apart from "the case explicitly wants this exact number," and
-    # let an explicit override win even when real derivation data is
-    # ALSO available -- i.e. "use the real curve/table for the MEDIAN
-    # (the anchor value), but I want to set the SPREAD myself" is now
-    # a supported combination, not just all-or-nothing.
+    # Every case explicitly declares, via scalars.csv, which source
+    # drives the peak loop, the volume loop, and gate reliability --
+    # validate_mc_sources() (called inside build_case()) already
+    # enforced that the declared source and the data/scalars it needs
+    # are both present; a case that's missing either fails BEFORE
+    # reaching this point, not partway through a run. What follows is
+    # a straight branch on that explicit choice -- no inference, no
+    # "does this file happen to exist" fallback chain.
     explicit_peak_cv = sc.get("mc_outer_peak_cv")
     explicit_volume_cv = sc.get("mc_outer_volume_cv")
+    peak_source = mc_sources["peak_source"]
+    volume_source = mc_sources["volume_source"]
+    target_return_period = outer_dist.get("target_return_period") if outer_dist else None
 
-    outer_source = "placeholder"
-    outer_cv = explicit_peak_cv if explicit_peak_cv is not None else OUTER_DEFAULT_CV
-    volume_cv = explicit_volume_cv if explicit_volume_cv is not None else VOLUME_DEFAULT_CV
-    median_scale = 1.0
-    volume_median_scale = 1.0
-    target_return_period = None
-    if outer_dist is not None:
-        try:
-            curve_T, curve_Q = load_flood_frequency_curve(outer_dist["curve_csv"])
-            target_return_period = outer_dist["target_return_period"]
-            anchor_Q = _loglog_interp(target_return_period, curve_T, curve_Q)
-            base_peak = float(max(inflow_base.Q))
-            median_scale = anchor_Q / base_peak
-            derived_cv = derive_outer_cv_from_alt_studies(
-                curve_T, curve_Q, outer_dist["alt_studies_csv"])
-            if explicit_peak_cv is not None:
-                outer_cv = explicit_peak_cv
-                outer_source = ("flood_frequency_curve (median: real data) + explicit "
-                                 "mc_outer_peak_cv override (spread: case-level judgment"
-                                 + (f", NOT the alt_studies-derived {derived_cv:.4f}"
-                                    if derived_cv is not None else "") + ")")
-            elif derived_cv is not None:
-                outer_cv = derived_cv
-                outer_source = "flood_frequency_curve + alt_studies (real data)"
-            else:
-                outer_source = "flood_frequency_curve (median only; CV still placeholder)"
-            print(f"  Outer loop (peak): targeting T={target_return_period}-yr flood, "
-                  f"curve peak={anchor_Q:.0f} m3/s vs. this case's own hydrograph peak="
-                  f"{base_peak:.0f} m3/s -> median scale={median_scale:.4f}, "
-                  f"cv={outer_cv:.4f} ({outer_source})")
-        except (FileNotFoundError, KeyError, ValueError, StopIteration) as e:
-            target_return_period = None
-            median_scale = 1.0
-            outer_cv = explicit_peak_cv if explicit_peak_cv is not None else OUTER_DEFAULT_CV
-            outer_source = "placeholder (mc_outer_distribution() set, but failed to load -- see warning above)"
-            print(f"  WARNING: {case_name}/case_config.py's mc_outer_distribution() points at "
-                  f"peak data that couldn't be read ({type(e).__name__}: {e}). Falling back to "
-                  f"the generic placeholder for the PEAK loop instead of stopping the run. Check "
-                  f"the 'curve_csv'/'alt_studies_csv' paths returned by mc_outer_distribution() "
-                  f"actually exist and are formatted as described in Data/Template/case_config.py.")
+    # inflow_hydrograph.csv IS the design hydrograph -- its own peak and
+    # volume are always the median (median_scale = volume_median_scale
+    # = 1.0), for every source EXCEPT "bootstrap". curve_csv/
+    # alt_studies_csv and volume_duration_csv are CV-ONLY inputs here:
+    # they never recompute the anchor away from the case's own
+    # hydrograph, because that hydrograph already IS the T-year design
+    # flood, not an approximation of one that external files should
+    # correct. "bootstrap" is the deliberate exception -- an FFA
+    # stress-test case's whole point is that the FFA tool's own median
+    # is a genuinely different, disputed central estimate (see
+    # FFA_Integration.md), not a refinement of the hydrograph's.
+    if peak_source == "user":
+        median_scale = 1.0
+        outer_cv = explicit_peak_cv
+        outer_source = ("user (mc_outer_peak_source='user' -- no curve data used; "
+                         f"cv={outer_cv:.4f} is a pure case-level judgment call)")
 
-    volume_source = "placeholder (locked to peak_scale)"
-    if outer_dist is not None and "volume_duration_csv" in outer_dist:
-        try:
-            dv_T, dv_Q, dv_V = load_duration_volume_table(outer_dist["volume_duration_csv"])
-            anchor_T = target_return_period if target_return_period is not None \
-                else outer_dist["target_return_period"]
-            anchor_V = _loglog_interp(anchor_T, dv_T, dv_V)
-            base_volume = float(np.sum(np.diff(inflow_base.t) *
-                                        (inflow_base.Q[:-1] + inflow_base.Q[1:]) / 2.0))  # m3
-            volume_median_scale = anchor_V / base_volume
-            derived_volume_cv = derive_volume_cv_from_duration_table(dv_T, dv_Q, dv_V)
-            if explicit_volume_cv is not None:
-                volume_cv = explicit_volume_cv
-                volume_source = ("flood_duration_volume_table (median: real data) + explicit "
-                                  "mc_outer_volume_cv override (spread: case-level judgment"
-                                  + (f", NOT the table-derived {derived_volume_cv:.4f}"
-                                     if derived_volume_cv is not None else "") + ")")
-            elif derived_volume_cv is not None:
-                volume_cv = derived_volume_cv
-                volume_source = "flood_duration_volume_table (real data, independent of peak)"
-            print(f"  Outer loop (volume, INDEPENDENT of peak): targeting T="
-                  f"{anchor_T}-yr flood, table volume={anchor_V/1e6:.0f} Mm3 vs. "
-                  f"this case's own hydrograph volume={base_volume/1e6:.0f} Mm3 -> "
-                  f"median scale={volume_median_scale:.4f}, cv={volume_cv:.4f} ({volume_source})")
-        except (FileNotFoundError, KeyError, ValueError, StopIteration) as e:
-            volume_median_scale = 1.0
-            volume_cv = explicit_volume_cv if explicit_volume_cv is not None else VOLUME_DEFAULT_CV
-            volume_source = "placeholder (mc_outer_distribution() set, but failed to load -- see warning above)"
-            print(f"  WARNING: {case_name}/case_config.py's mc_outer_distribution() points at "
-                  f"volume data that couldn't be read ({type(e).__name__}: {e}). Falling back to "
-                  f"the generic placeholder for the VOLUME loop instead of stopping the run. Check "
-                  f"the 'volume_duration_csv' path returned by mc_outer_distribution() actually "
-                  f"exists and is formatted as described in Data/Template/case_config.py.")
+    elif peak_source == "curve":
+        curve_T, curve_Q = load_flood_frequency_curve(outer_dist["curve_csv"])
+        derived_cv = derive_outer_cv_from_alt_studies(
+            curve_T, curve_Q, outer_dist["alt_studies_csv"])
+        if derived_cv is None:
+            raise MCConfigError(
+                f"{case_name}: mc_outer_peak_source='curve' but "
+                f"alt_studies_csv has fewer than 2 rows -- not enough to "
+                f"derive a CV from. Add more rows, or switch to "
+                f"mc_outer_peak_source='user' with an explicit mc_outer_peak_cv.")
+        median_scale = 1.0
+        if explicit_peak_cv is not None:
+            outer_cv = explicit_peak_cv
+            outer_source = ("curve (median: this case's own inflow_hydrograph.csv, "
+                             "unchanged) + explicit mc_outer_peak_cv override "
+                             f"(spread: case-level judgment, NOT the alt_studies-"
+                             f"derived {derived_cv:.4f})")
+        else:
+            outer_cv = derived_cv
+            outer_source = ("curve (median: this case's own inflow_hydrograph.csv, "
+                             "unchanged; spread: alt_studies, real data)")
+        print(f"  Outer loop (peak): mc_outer_peak_source='curve' -- median stays "
+              f"at this case's own hydrograph peak (curve_csv/alt_studies_csv used "
+              f"for CV only), cv={outer_cv:.4f} ({outer_source})")
+
+    elif peak_source == "bootstrap":
+        ci_T, ci_lower, ci_median, ci_upper = load_bootstrap_ci_curve(outer_dist["bootstrap_ci_csv"])
+        ci_confidence = outer_dist.get("bootstrap_ci_confidence", 0.95)
+        anchor_Q, derived_cv = derive_outer_cv_from_bootstrap_ci(
+            ci_T, ci_lower, ci_median, ci_upper, target_return_period, ci_confidence)
+        base_peak = float(max(inflow_base.Q))
+        median_scale = anchor_Q / base_peak
+        if explicit_peak_cv is not None:
+            outer_cv = explicit_peak_cv
+            outer_source = ("bootstrap (median: FFA bootstrap_ci_csv, DIFFERENT from "
+                             "this case's own hydrograph peak by design -- the whole "
+                             "point of this stress-test case) + explicit "
+                             f"mc_outer_peak_cv override (spread: case-level judgment, "
+                             f"NOT the bootstrap-derived {derived_cv:.4f})")
+        else:
+            outer_cv = derived_cv
+            outer_source = (f"bootstrap (median AND spread both from FFA bootstrap_ci_csv "
+                             f"at {ci_confidence:.0%} CI -- see FFA_Integration.md; median "
+                             f"DELIBERATELY differs from this case's own hydrograph peak, "
+                             f"this is almost always a stress-test case, not the primary case)")
+        print(f"  Outer loop (peak): mc_outer_peak_source='bootstrap', targeting "
+              f"T={target_return_period}-yr flood, bootstrap median={anchor_Q:.0f} m3/s vs. "
+              f"this case's own hydrograph peak={base_peak:.0f} m3/s -> "
+              f"median scale={median_scale:.4f}, cv={outer_cv:.4f} ({outer_source})")
+
+    if volume_source == "user":
+        volume_median_scale = 1.0
+        volume_cv = explicit_volume_cv
+        volume_source_desc = ("user (mc_outer_volume_source='user' -- no duration/volume data "
+                               f"used; cv={volume_cv:.4f} is a pure case-level judgment call)")
+
+    elif volume_source == "table":
+        dv_T, dv_Q, dv_V = load_duration_volume_table(outer_dist["volume_duration_csv"])
+        derived_volume_cv = derive_volume_cv_from_duration_table(dv_T, dv_Q, dv_V)
+        if derived_volume_cv is None:
+            raise MCConfigError(
+                f"{case_name}: mc_outer_volume_source='table' but "
+                f"volume_duration_csv has fewer than 2 rows -- not enough to "
+                f"derive a CV from. Add more rows, or switch to "
+                f"mc_outer_volume_source='user' with an explicit mc_outer_volume_cv.")
+        volume_median_scale = 1.0
+        if explicit_volume_cv is not None:
+            volume_cv = explicit_volume_cv
+            volume_source_desc = ("table (median: this case's own inflow_hydrograph.csv, "
+                                   "unchanged) + explicit mc_outer_volume_cv override "
+                                   f"(spread: case-level judgment, NOT the table-derived "
+                                   f"{derived_volume_cv:.4f})")
+        else:
+            volume_cv = derived_volume_cv
+            volume_source_desc = ("table (median: this case's own inflow_hydrograph.csv, "
+                                   "unchanged; spread: flood_duration_volume_table, real data)")
+        print(f"  Outer loop (volume, INDEPENDENT of peak): mc_outer_volume_source='table' "
+              f"-- median stays at this case's own hydrograph volume (volume_duration_csv "
+              f"used for CV only), cv={volume_cv:.4f} ({volume_source_desc})")
+
+    volume_source = volume_source_desc
 
     rng = np.random.default_rng(seed)
     outer_draws = default_outer_sampler(rng, n_outer, outer_cv, volume_cv,
@@ -771,6 +981,7 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
         "h0_sigma": h0_sigma, "area_cv": area_cv, "rule": rule,
         "uncertain_params": uncertain_params,
         "gate_availability": gate_availability,
+        "gate_source": mc_sources["gate_source"],
         "seed": seed,
     }
     return records, meta
@@ -920,6 +1131,8 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
                         "mean; it is a first-pass ranking, not a rigorous sensitivity measure):\n")
                 ranked = rank_importance(ga["component_pfs"], ga["ccf_groups"])
                 f.write(format_importance_table(ranked) + "\n")
+            f.write(f"  Gate reliability source: mc_gate_reliability_source="
+                    f"'{meta['gate_source']}'\n")
         else:
             f.write("Gate availability: not modeled (no mc_gate_availability() declared)\n")
         f.write("\n")
