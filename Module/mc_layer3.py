@@ -573,17 +573,37 @@ def _require_scalar_str(sc: dict, key: str, valid: set[str], case_name: str) -> 
     return val
 
 
-def validate_mc_sources(sc: dict, outer_dist: dict | None, case_name: str) -> dict:
+def validate_mc_sources(sc: dict, outer_dist: dict | None, case_name: str,
+                         has_gate_hook: bool = False) -> dict:
     """Validates and returns the three explicit source selections this
     case has made, cross-checked against what data/scalars they each
     require. Raises MCConfigError (before any simulation runs) if the
     declared source and the available data/scalars don't line up --
     e.g. source='bootstrap' but mc_outer_distribution() has no
     'bootstrap_ci_csv' key, or source='user' but the corresponding _cv
-    scalar isn't set. Called once per run_case_layer3() call."""
+    scalar isn't set. Called once per run_case_layer3() call.
+
+    has_gate_hook : whether this case's case_config.py actually defines
+        mc_gate_availability() (passed in by build_case(), which is the
+        one place that knows -- this function itself never imports/
+        inspects case_config). mc_gate_reliability_source is REQUIRED
+        only when True -- a case with no gate-reliability hook at all
+        has nothing for that scalar to configure, so it would be a
+        pointless, confusing requirement to impose on every case
+        regardless. If mc_gate_reliability_source is present anyway
+        despite has_gate_hook=False (e.g. left over from an earlier
+        version of the case, or set defensively ahead of adding the
+        hook later), its VALUE is still validated -- a stray typo
+        shouldn't silently pass just because it's currently unused --
+        it's only the row's ABSENCE that's tolerated in that case."""
     peak_source = _require_scalar_str(sc, "mc_outer_peak_source", VALID_PEAK_SOURCES, case_name)
     volume_source = _require_scalar_str(sc, "mc_outer_volume_source", VALID_VOLUME_SOURCES, case_name)
-    gate_source = _require_scalar_str(sc, "mc_gate_reliability_source", VALID_GATE_SOURCES, case_name)
+    if has_gate_hook:
+        gate_source = _require_scalar_str(sc, "mc_gate_reliability_source", VALID_GATE_SOURCES, case_name)
+    elif "mc_gate_reliability_source" in sc:
+        gate_source = _require_scalar_str(sc, "mc_gate_reliability_source", VALID_GATE_SOURCES, case_name)
+    else:
+        gate_source = None
 
     def need(key):
         if key not in sc:
@@ -744,10 +764,11 @@ def build_case(case_name: str, rule: str = "baseline"):
               "since 'curve'/'bootstrap'/'table' all need this hook). See "
               "Data/Template/case_config.py for the pattern to add it.")
 
-    mc_sources = validate_mc_sources(sc, outer_dist, case_name)
+    has_gate_hook = hasattr(case_config, "mc_gate_availability")
+    mc_sources = validate_mc_sources(sc, outer_dist, case_name, has_gate_hook=has_gate_hook)
 
     gate_availability = None
-    if hasattr(case_config, "mc_gate_availability"):
+    if has_gate_hook:
         sig = inspect.signature(case_config.mc_gate_availability)
         if "source" not in sig.parameters:
             raise MCConfigError(
@@ -997,7 +1018,15 @@ def _min_realizations_mean(sigma: float, mu: float, epsilon: float = 0.01, alpha
     within relative error `epsilon` (e.g. 0.01 = 1%) at confidence
     `alpha`. sigma/mu are the output's own standard deviation/mean --
     NOT case inputs. Verified against the manual's own worked example
-    (sigma=15, mu=100, epsilon=0.01, alpha=0.95 -> ~865)."""
+    (sigma=15, mu=100, epsilon=0.01, alpha=0.95 -> ~865).
+
+    IMPORTANT for this project's nested two-loop design: the manual's
+    formula assumes the realizations being counted are INDEPENDENT.
+    Layer 3's n_outer*n_inner draws are not -- see
+    _cluster_bootstrap_stats()'s docstring. Callers should compare this
+    function's result against n_outer (the true count of independent
+    flood scenarios), not n_outer*n_inner, or the resulting margin will
+    be overstated."""
     z = NormalDist().inv_cdf((1 + alpha) / 2)
     if mu == 0:
         return float("inf")
@@ -1009,43 +1038,96 @@ def _min_realizations_percentile(p: float, dp: float = 0.01, alpha: float = 0.95
     Monte Carlo realizations for the p-th percentile (e.g. p=0.95) to
     be estimated within tolerance `dp` (in probability units, e.g.
     0.01) at confidence `alpha`. Verified against the manual's own
-    worked example (p=0.95, dp=0.01, alpha=0.95 -> ~1825)."""
+    worked example (p=0.95, dp=0.01, alpha=0.95 -> ~1825).
+
+    Same effective-N caveat as _min_realizations_mean() above -- compare
+    against n_outer, not n_outer*n_inner, for this project's nested
+    design."""
     z = NormalDist().inv_cdf((1 + alpha) / 2)
     return p * (1 - p) * (z / dp) ** 2
 
 
-def _bootstrap_percentile_se(data: np.ndarray, percentiles: list[float],
-                              n_boot: int = 500, seed: int = 0) -> dict[float, float]:
-    """Bootstrap standard error for each of `percentiles` (e.g.
-    [5, 50, 95]), via n_boot resamples of `data` WITH replacement,
-    vectorized (one (n_boot x len(data)) index array, not a Python
-    loop). No simple closed form exists for a percentile's SE in
-    general, unlike a probability estimate's (which uses the exact
-    binomial sqrt(p*(1-p)/N) formula instead, computed inline where
-    needed -- bootstrap is reserved for percentiles specifically."""
+def _cluster_bootstrap_stats(outer_peak_levels: list[np.ndarray], percentiles: list[float],
+                              thresholds: list[float], n_boot: int = 500, seed: int = 0
+                              ) -> tuple[dict[float, float], float, dict[float, float]]:
+    """Block/cluster bootstrap standard errors for the percentiles, the
+    mean, AND any exceedance-probability thresholds, all computed from
+    the SAME resampled replicates so the three are internally
+    consistent with each other.
+
+    WHY this replaced a flat (per-draw) bootstrap: Layer 3's 15,000
+    draws are NOT 15,000 independent observations -- they're 100
+    independent outer-loop flood scenarios, each contributing 150
+    correlated inner-loop draws (correlated because they share the
+    same flood magnitude/volume). A flat bootstrap that resamples
+    individual draws from the pooled 15,000 treats every draw as its
+    own independent piece of evidence, which understates the true
+    standard error for anything sensitive to WHICH outer scenarios got
+    drawn -- confirmed empirically: two identical runs differing only
+    in --seed showed P95 differing by ~11.5x the flat bootstrap's
+    stated SE, and the mean by ~8x (both were run into the noise floor
+    a genuine i.i.d. sample of this size shouldn't produce; the
+    exceedance probabilities and P50 happened to be far less sensitive
+    to this in that comparison, which is WHY they still checked out --
+    not evidence the clustering doesn't apply to them in principle).
+
+    Mechanism: each bootstrap replicate resamples WHICH of the n_outer
+    scenarios to include (with replacement), keeping each selected
+    scenario's full block of n_inner draws together -- so a replicate
+    either includes an entire flood scenario's worth of correlated
+    draws, or none of them, respecting the actual nested design instead
+    of pretending every draw is independent. Requires every outer
+    scenario to have contributed the same n_inner (true for this
+    project's Layer 3 design -- every outer draw gets the same n_inner).
+
+    Returns (pctl_se, mean_se, threshold_se) -- threshold_se keyed by
+    the threshold values passed in. A threshold with zero exceedances
+    across every draw returns an SE of 0.0 here (every bootstrap
+    replicate is also zero) -- callers should use the separate
+    ~3/n_outer bound for that case (see _format_exceedance()), not this
+    function's SE, which is trivially uninformative when the estimate
+    itself is exactly zero."""
     rng = np.random.default_rng(seed)
-    n = len(data)
-    idx = rng.integers(0, n, size=(n_boot, n))
-    boot_samples = data[idx]
-    boot_pctl = np.percentile(boot_samples, percentiles, axis=1)  # shape (len(percentiles), n_boot)
-    return {p: float(np.std(boot_pctl[i], ddof=1)) for i, p in enumerate(percentiles)}
+    n_outer = len(outer_peak_levels)
+    block_matrix = np.array(outer_peak_levels)  # shape (n_outer, n_inner)
+    chosen = rng.integers(0, n_outer, size=(n_boot, n_outer))
+    replicates = block_matrix[chosen].reshape(n_boot, -1)  # (n_boot, n_outer*n_inner)
+
+    boot_pctl = np.percentile(replicates, percentiles, axis=1)  # (len(percentiles), n_boot)
+    pctl_se = {p: float(np.std(boot_pctl[i], ddof=1)) for i, p in enumerate(percentiles)}
+
+    mean_se = float(np.std(replicates.mean(axis=1), ddof=1))
+
+    threshold_se = {}
+    for t in thresholds:
+        boot_frac = np.mean(replicates > t, axis=1)  # (n_boot,)
+        threshold_se[t] = float(np.std(boot_frac, ddof=1))
+
+    return pctl_se, mean_se, threshold_se
 
 
 
-def _format_exceedance(frac: float, n_total: int) -> str:
-    """Formats an exceedance-probability estimate with either its
-    closed-form binomial standard error (SE = sqrt(p(1-p)/N)), or, if
-    ZERO events were observed in this run, the standard ~3/N upper-
-    bound caveat instead of a bare '0.0000' -- a bare zero reads as
-    'impossible', which it isn't; a rare event can easily produce zero
-    observed occurrences in a finite run without the true probability
-    being zero."""
+def _format_exceedance(frac: float, se: float, n_outer: int, n_total: int) -> str:
+    """Formats an exceedance-probability estimate with its cluster-
+    bootstrap standard error (see _cluster_bootstrap_stats() -- NOT the
+    closed-form binomial sqrt(p(1-p)/N_total), which assumes N_total
+    independent draws and understates the true SE for the same nested-
+    design reason percentile/mean SEs did), or, if ZERO events were
+    observed in this run, the ~3/n_outer upper-bound caveat instead of
+    a bare '0.0000' -- a bare zero reads as 'impossible', which it
+    isn't; a rare event can easily produce zero observed occurrences in
+    a finite run without the true probability being zero. n_outer, not
+    n_total, is the right denominator for that bound too: an outer
+    scenario severe enough to produce ANY exceedance would typically
+    produce many correlated exceedances among its own inner draws, so
+    the number of genuinely independent 'trials' this run tested is
+    much closer to n_outer than to n_total."""
     if frac == 0.0:
-        bound = 3.0 / n_total
-        return (f"0.0000 (0 of {n_total} draws -- true probability bounded above by "
-                 f"roughly 3/N ~= {bound:.4f}, NOT zero)")
-    se = (frac * (1 - frac) / n_total) ** 0.5
-    return f"{frac:.4f} (SE~={se:.4f}, binomial approx)"
+        bound = 3.0 / n_outer
+        return (f"0.0000 (0 of {n_total} draws across {n_outer} independent outer "
+                f"scenarios -- true probability bounded above by roughly "
+                f"3/n_outer ~= {bound:.4f}, NOT zero)")
+    return f"{frac:.4f} (SE~={se:.4f}, cluster bootstrap)"
 
 
 def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None:
@@ -1074,11 +1156,15 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
     n_total = n_outer * n_inner
     mean_level = float(np.mean(peak_levels))
     std_level = float(np.std(peak_levels, ddof=1))
-    se_mean = std_level / np.sqrt(n_total)  # closed-form SEM
-    pctl_se = _bootstrap_percentile_se(peak_levels, [5, 50, 95])
+    thresholds = [t for t in (meta["max_flood_level"], meta["dam_crest_level"]) if t is not None]
+    pctl_se, se_mean, threshold_se = _cluster_bootstrap_stats(
+        outer_peak_levels, [5, 50, 95], thresholds)
     # Eq. 176/177 (RMC-TotalRisk manual) convergence checks -- see the
     # two helper functions' docstrings for the verified formulas and
     # the manual's own worked examples they were checked against.
+    # Compared against n_outer, NOT n_total -- see
+    # _cluster_bootstrap_stats()'s docstring for why n_outer is the
+    # true effective independent sample size for this nested design.
     n_min_mean = _min_realizations_mean(std_level, mean_level)
     n_min_p95 = _min_realizations_percentile(0.95)
     summary_path = os.path.join(mc_dir, "mc_summary.txt")
@@ -1141,19 +1227,26 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
                 f"mean={mean_level:.3f} (SE~={se_mean:.3f})  "
                 f"max={peak_levels.max():.3f}  min={peak_levels.min():.3f}\n")
         f.write(f"Convergence (RMC-TotalRisk manual Eq. 176/177, target: mean within +/-1%, "
-                f"P95 within +/-0.01, both at 95% confidence): "
-                f"mean needs >={n_min_mean:.0f} realizations (this run: {n_total}, "
-                f"{n_total / n_min_mean:.1f}x margin); "
-                f"P95 needs >={n_min_p95:.0f} realizations (this run: {n_total}, "
-                f"{n_total / n_min_p95:.1f}x margin)\n")
+                f"P95 within +/-0.01, both at 95% confidence). NOTE: margin below is computed "
+                f"against n_outer={n_outer}, the effective INDEPENDENT sample size for this "
+                f"nested two-loop design, NOT the raw {n_total} total draws -- the {n_inner} "
+                f"inner draws per outer scenario are correlated (same flood magnitude/volume), "
+                f"so they don't each count as fresh independent evidence for outer-loop-"
+                f"sensitive statistics like the mean and P95. See "
+                f"_cluster_bootstrap_stats()'s docstring for the empirical confirmation "
+                f"(cross-seed comparison) that motivated this: "
+                f"mean needs >={n_min_mean:.0f} independent realizations (this run: {n_outer}, "
+                f"{n_outer / n_min_mean:.1f}x margin); "
+                f"P95 needs >={n_min_p95:.0f} independent realizations (this run: {n_outer}, "
+                f"{n_outer / n_min_p95:.1f}x margin)\n")
         if meta["max_flood_level"] is not None:
             frac = float(np.mean(peak_levels > meta["max_flood_level"]))
             f.write(f"P(peak level > max_flood_level={meta['max_flood_level']}): "
-                    f"{_format_exceedance(frac, n_total)}\n")
+                    f"{_format_exceedance(frac, threshold_se.get(meta['max_flood_level'], 0.0), n_outer, n_total)}\n")
         if meta["dam_crest_level"] is not None:
             frac = float(np.mean(peak_levels > meta["dam_crest_level"]))
             f.write(f"P(peak level > dam_crest_level={meta['dam_crest_level']}): "
-                    f"{_format_exceedance(frac, n_total)}\n")
+                    f"{_format_exceedance(frac, threshold_se.get(meta['dam_crest_level'], 0.0), n_outer, n_total)}\n")
 
     print(f"\nWrote {csv_path}")
     print(f"Wrote {plot_path}")
@@ -1173,15 +1266,19 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
           f"P50={p50:.3f} (SE~={pctl_se[50]:.3f})  P95={p95:.3f} (SE~={pctl_se[95]:.3f})  "
           f"mean={mean_level:.3f} (SE~={se_mean:.3f}) "
           f"(max_flood_level={meta['max_flood_level']}, dam_crest_level={meta['dam_crest_level']})")
-    print(f"Convergence (Eq. 176/177): mean needs >={n_min_mean:.0f} realizations "
-          f"({n_total / n_min_mean:.1f}x margin); P95 needs >={n_min_p95:.0f} realizations "
-          f"({n_total / n_min_p95:.1f}x margin)")
+    print(f"Convergence (Eq. 176/177, vs. n_outer={n_outer} independent scenarios, "
+          f"NOT n_total={n_total} -- see mc_summary.txt for why): "
+          f"mean needs >={n_min_mean:.0f} realizations "
+          f"({n_outer / n_min_mean:.1f}x margin); P95 needs >={n_min_p95:.0f} realizations "
+          f"({n_outer / n_min_p95:.1f}x margin)")
     if meta["max_flood_level"] is not None:
         frac = float(np.mean(peak_levels > meta["max_flood_level"]))
-        print(f"P(exceeds max_flood_level) = {_format_exceedance(frac, n_total)}")
+        print(f"P(exceeds max_flood_level) = "
+              f"{_format_exceedance(frac, threshold_se.get(meta['max_flood_level'], 0.0), n_outer, n_total)}")
     if meta["dam_crest_level"] is not None:
         frac = float(np.mean(peak_levels > meta["dam_crest_level"]))
-        print(f"P(exceeds dam_crest_level) = {_format_exceedance(frac, n_total)}")
+        print(f"P(exceeds dam_crest_level) = "
+              f"{_format_exceedance(frac, threshold_se.get(meta['dam_crest_level'], 0.0), n_outer, n_total)}")
 
 
 # ---------------------------------------------------------------------

@@ -604,7 +604,7 @@ def scalars(case_dir: str):
     numeric; a genuinely malformed numeric row still fails loudly via
     the ValueError float() raises, exactly as before."""
     import csv
-    vals = {}
+    vals: dict[str, float | str] = {}
     scalars_csv = os.path.join(case_dir, "scalars.csv")
     with open(scalars_csv, encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
