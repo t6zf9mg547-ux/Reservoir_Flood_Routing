@@ -43,9 +43,10 @@ python Module/validate_against_original.py Template
   - `scalars.csv`: t_max, dt, print_every, H0, and optionally
     dam_crest_level, max_flood_level (see "Safety thresholds" below).
     Also where Layer 3's mandatory `mc_outer_peak_source`/
-    `mc_outer_volume_source`/`mc_gate_reliability_source` selections
-    live (see "Layer 3" below) -- required only if you run Layer 3 for
-    this case, irrelevant to Layer 1/2
+    `mc_outer_volume_source`/`mc_gate_reliability_source` selections,
+    and the optional `mc_peak_volume_dependence`/`mc_peak_volume_tau`
+    pair, live (see "Layer 3" below) -- required only if you run
+    Layer 3 for this case, irrelevant to Layer 1/2
   - `case_config.py` : the ONE file where you define which outlets
     exist and their parameters/operating rules (see below)
 
@@ -355,9 +356,10 @@ resulting distribution rather than one number.
 
 **Two nested loops, deliberately kept separate:**
 - **Outer loop** -- "which flood magnitude are we facing": draws a
-  peak scale factor and, independently, a volume scale factor (see
-  "Why peak and volume are sampled independently" below), applied to
-  this case's own `inflow_hydrograph.csv`.
+  peak scale factor and a volume scale factor, applied to this case's
+  own `inflow_hydrograph.csv`. Independent by default (see "Peak-volume
+  dependence" below) -- optionally correlated via a copula if a case
+  opts in.
 - **Inner loop** -- "how do the physical structures perform, for a
   fixed flood": for each outer draw, re-runs the simulation many times,
   varying discharge/rating coefficients, the reservoir's initial level
@@ -448,18 +450,58 @@ CV (median stays whatever that source dictates) -- i.e. "use the real
 curve/table/bootstrap data, but I want to set the SPREAD myself" is a
 supported combination, not all-or-nothing.
 
-**Why peak and volume are sampled independently:** a single uniform
-scale factor on the whole hydrograph moves peak and volume together,
-silently assuming they're perfectly correlated. That's rarely true --
-real design-hydrograph studies often use a shorter, more intense storm
-duration for the most extreme events and a longer one for more
-frequent floods, which changes the volume-to-peak ratio, not just the
-magnitude. For any reservoir that provides meaningful attenuation,
-volume (not just peak) is often a first-order control on the routed
-peak level, so `ScaledHydrograph` (in `mc_layer3.py`) supports
-independent `peak_scale` and `volume_scale`, achieved by stretching
-the hydrograph's time axis around its own time-to-peak rather than
-just rescaling its magnitude.
+**Peak-volume dependence:** a single uniform scale factor on the whole
+hydrograph moves peak and volume together, silently assuming they're
+perfectly correlated. That's rarely true -- real design-hydrograph
+studies often use a shorter, more intense storm duration for the most
+extreme events and a longer one for more frequent floods, which changes
+the volume-to-peak ratio, not just the magnitude. For any reservoir
+that provides meaningful attenuation, volume (not just peak) is often a
+first-order control on the routed peak level, so `ScaledHydrograph` (in
+`mc_layer3.py`) supports independent `peak_scale` and `volume_scale`,
+achieved by stretching the hydrograph's time axis around its own
+time-to-peak rather than just rescaling its magnitude.
+
+Full independence is itself a real, documented limitation, though --
+peak and volume come from the SAME storm event, so flood-frequency
+literature treats them as physically correlated, not independent (see
+Requena, Mediero & Garrote, 2013, *HESS* 17:3023-3038, the direct
+precedent for this project's own peak-volume -> synthetic hydrograph ->
+reservoir routing -> overtopping-risk chain). `mc_peak_volume_dependence`
+in `scalars.csv` is OPTIONAL and defaults to `"independent"` (the
+behavior above, unchanged, no row needed) -- but a case can opt into
+copula-based joint sampling instead:
+
+- `"independent"` -- default; no row needed at all.
+- `"gaussian"` -- correlated via a Gaussian copula.
+- `"gumbel"` -- correlated via a Gumbel-Hougaard copula, which has
+  UPPER TAIL DEPENDENCE (extreme peak and extreme volume co-occur MORE
+  than under `"gaussian"` at the same `tau`) -- more often the
+  literature-preferred fit for this specific pair, and the more
+  conservative choice for a dam-safety application, since it doesn't
+  understate exactly the tail that drives crest-exceedance risk.
+
+Either non-default choice requires `mc_peak_volume_tau` -- Kendall's
+tau, `0 <= tau < 1` -- the quantity you'd estimate from a case's own
+paired annual-maximum peak/volume record (the same record an FFA tool
+would use), via a rank-correlation statistic across historical
+peak/volume pairs. **This is a genuinely different piece of evidence
+from either marginal's own CV** -- an FFA bootstrap fit to the peak
+series ALONE, or a duration/volume table, tells you nothing about how
+peak and volume co-vary; that requires the two measured together,
+event by event. Literature-reported values commonly fall around
+0.4-0.7 for peak-volume pairs across various basins -- a starting
+REFERENCE range only, not a default to assume for any specific case
+without a paired record to check it against.
+
+Marginal medians/CVs (`mc_outer_peak_source`/`mc_outer_volume_source`,
+above) are completely UNCHANGED by this setting either way -- the
+copula only links two marginals that already exist; it doesn't
+substitute for having a volume CV in the first place, and it doesn't
+touch how the median or CV of either marginal was derived. See
+`Module/mc_layer3.py`'s `_sample_gaussian_copula_normals()`/
+`_sample_gumbel_copula_uniforms()` docstrings for the sampling
+algorithms (Marshall-Olkin/Chambers-Mallows-Stuck for Gumbel).
 
 **Opting a case into real CV data, on top of the mandatory source
 selection above:** `mc_uncertain_params()` and `mc_outer_distribution()`
@@ -665,32 +707,53 @@ not just how well it performs given that it does.
   `mc_gate_availability()`, so the column layout stays consistent
   across cases)
 - `Output/<CaseName>/MonteCarlo/mc_summary.txt` -- headline percentiles
-  (P5/P50/P95/mean, each with a standard error -- bootstrap for the
-  percentiles, closed-form SEM for the mean), exceedance probabilities
-  (with their closed-form binomial standard error, or, if zero events
+  (P5/P50/P95/mean, each with a standard error), exceedance
+  probabilities (with their own standard error, or, if zero events
   were observed in the run, an explicit "bounded above by roughly
-  3/N, NOT zero" caveat instead of a bare `0.0000` -- a rare event
-  producing zero observed occurrences in a finite run doesn't mean the
-  true probability is zero), exactly which sampling source was
-  declared and used (`mc_outer_peak_source`/`mc_outer_volume_source`/
-  `mc_gate_reliability_source`, all three explicit per-case choices --
-  see "Every case must explicitly declare its sampling sources"
-  above), the run's `--seed`, and -- if `mc_gate_availability()` is
-  declared -- each named common-cause branch's declared probability
-  and empirical fired fraction over the run, the empirical-vs-closed-
-  form `P(>=1 gate failed)` sanity check, and, for the CI-evidence
-  form specifically, an importance ranking (which subsystem type or
+  3/n_outer, NOT zero" caveat instead of a bare `0.0000` -- a rare
+  event producing zero observed occurrences in a finite run doesn't
+  mean the true probability is zero). ALL of these standard errors --
+  percentiles, mean, AND exceedance probabilities -- come from a
+  CLUSTER (block) bootstrap that resamples whole outer scenarios, not
+  individual draws (`_cluster_bootstrap_stats()` in `mc_layer3.py`),
+  because the 15,000-ish draws in a typical run are NOT that many
+  independent observations -- they're `n_outer` independent flood
+  scenarios, each contributing `n_inner` CORRELATED draws (correlated
+  because they share the same flood magnitude/volume). A flat, per-
+  draw bootstrap or closed-form formula that ignores this structure
+  understates the true standard error, sometimes severely -- confirmed
+  empirically via a cross-seed comparison (two otherwise-identical
+  runs differing only in `--seed` showed a ~11.5x discrepancy between
+  a flat bootstrap's stated P95 SE and the actual cross-seed spread,
+  resolved to ~1.3x once corrected). Also reported: exactly which
+  sampling source was declared and used
+  (`mc_outer_peak_source`/`mc_outer_volume_source`/
+  `mc_gate_reliability_source`/`mc_peak_volume_dependence`, each an
+  explicit per-case choice -- see "Every case must explicitly declare
+  its sampling sources" and "Peak-volume dependence" above), the run's
+  `--seed`, and -- if `mc_gate_availability()` is declared -- each
+  named common-cause branch's declared probability and empirical fired
+  fraction over the run, the empirical-vs-closed-form
+  `P(>=1 gate failed)` sanity check, and, for the CI-evidence form
+  specifically, an importance ranking (which subsystem type or
   common-cause branch is carrying the most probability weight -- see
   `Module/reliability/importance.py`'s docstring for what this
   ranking does and doesn't mean).
 - Convergence check, alongside the above: minimum-realizations
   thresholds for the reported mean and P95, per the USACE RMC-
   TotalRisk Technical Reference Manual's Equations 176/177, compared
-  against this run's actual draw count as a margin (e.g. "P95 needs
-  >=1825 realizations -- this run: 15000, 8.2x margin"). A margin
-  below 1x is a real, actionable flag that random sampling noise
+  against `n_outer` -- the TRUE EFFECTIVE INDEPENDENT sample size for
+  this nested design, NOT the raw total draw count -- as a margin
+  (e.g. "P95 needs >=1825 realizations -- this run: n_outer=100,
+  0.055x margin"). Comparing against the raw draw count instead (as an
+  earlier version of this check did) dramatically overstates how
+  converged a run actually is, for exactly the same reason the SE
+  calculations above needed the same nested-design correction. A
+  margin below 1x is a real, actionable flag that random sampling noise
   alone could shift the reported value beyond the stated tolerance,
-  not just a theoretical caveat.
+  not just a theoretical caveat -- and, for P95 specifically, is common
+  even at draw counts that look large in raw terms; more `n_outer`
+  (not more `n_inner`) is what closes this margin.
 - `Plot/<CaseName>/MonteCarlo/mc_distribution.png` -- a histogram of
   peak levels pooled across all draws, alongside an exceedance curve
   (worst-to-best ranking) with each outer draw's own curve shown as a

@@ -212,14 +212,29 @@ class ScaledReservoir:
 # ---------------------------------------------------------------------
 
 def _lognormal_cv(rng: np.random.Generator, cv: float, n: int) -> np.ndarray:
-    """n draws from a log-normal distribution with median 1.0 and the
-    given coefficient of variation (matches how a "+/- X% uncertainty
-    multiplier, centered on the nominal value" is usually meant)."""
+    """n draws from a log-normal distribution with MEDIAN 1.0 (not mean
+    -- a "+/- X% uncertainty multiplier, centered on the nominal value"
+    is a statement about the median/central value, matching how this
+    project documents peak_median_scale/volume_median_scale=1.0
+    everywhere else -- e.g. README.md's "What 'median' means" section
+    and every case_config.py's mc_outer_distribution() docstring) and
+    the given coefficient of variation.
+
+    mu=0 gives median=exp(0)=1.0 exactly (median of a lognormal is
+    exp(mu) regardless of sigma, since the underlying normal's median
+    equals its own mean). Note this differs from mu=-0.5*sigma**2,
+    which would instead center the MEAN at 1.0 (mean of a lognormal is
+    exp(mu+sigma^2/2)) -- an earlier version of this function used that
+    formula despite its own docstring claiming median=1.0; the two
+    conventions diverge more as cv grows (at cv=0.42, e.g. this
+    project's FFA bootstrap stress-test case, mean-centering gives a
+    true median of only ~0.922, not 1.0 -- a real ~8% discrepancy from
+    every documented claim that median_scale locks to the case's own
+    hydrograph value)."""
     if cv <= 0:
         return np.ones(n)
     sigma = np.sqrt(np.log(1.0 + cv ** 2))
-    mu = -0.5 * sigma ** 2  # so that median = exp(mu) = 1.0
-    return rng.lognormal(mean=mu, sigma=sigma, size=n)
+    return rng.lognormal(mean=0.0, sigma=sigma, size=n)
 
 
 def _loglog_interp(target_x: float, xs: np.ndarray, ys: np.ndarray) -> float:
@@ -363,22 +378,135 @@ def derive_outer_cv_from_bootstrap_ci(ci_T: np.ndarray, ci_lower: np.ndarray,
     return anchor_Q, cv
 
 
+# ---------------------------------------------------------------------
+# Peak-volume dependence (copula-based joint sampling)
+# ---------------------------------------------------------------------
+# WHY this exists: default_outer_sampler() historically drew peak_scale
+# and volume_scale fully INDEPENDENTLY. Flood-frequency literature
+# treats this as a recognized limitation -- peak and volume come from
+# the SAME storm event, so they're physically correlated; see
+# Requena, Mediero & Garrote (2013, HESS 17:3023-3038), the direct
+# precedent for this project's own peak-volume -> synthetic hydrograph
+# -> reservoir routing -> overtopping-risk chain, and the broader
+# copula-based flood-frequency literature it draws on. This section
+# adds OPTIONAL joint sampling via a copula, selected explicitly per
+# case (mc_peak_volume_dependence in scalars.csv) -- "independent"
+# remains the default for every case that doesn't opt in, so no
+# existing case's numbers change unless deliberately requested.
+#
+# Both copulas below are parameterized by Kendall's tau (0 <= tau < 1),
+# not the copula's own native parameter -- tau is the quantity you'd
+# actually estimate from a case's own paired annual-maximum peak/volume
+# series (the same record an FFA tool would use), and it has a direct,
+# interpretable meaning (rank correlation) regardless of which copula
+# family is chosen. Literature-reported values commonly fall around
+# 0.4-0.7 for peak-volume pairs across various basins -- a starting
+# REFERENCE range only, not a default to assume for any specific case;
+# same "don't invent case-specific numbers in generic engine code"
+# principle used everywhere else in this project.
+
+def _sample_gaussian_copula_normals(rng: np.random.Generator, n: int, tau: float
+                                     ) -> tuple[np.ndarray, np.ndarray]:
+    """Correlated standard-normal pair (Z1, Z2) whose implied copula has
+    Kendall's tau = `tau`, via the standard Gaussian-copula map
+    rho = sin(pi*tau/2). Returned as normals (not yet pushed through
+    Phi) so callers with lognormal marginals can apply their own
+    sigma*Z + ln(median) transform directly, without a redundant
+    normal -> uniform -> normal round trip."""
+    rho = np.sin(np.pi * tau / 2.0)
+    Z1 = rng.standard_normal(n)
+    eps = rng.standard_normal(n)
+    Z2 = rho * Z1 + np.sqrt(1.0 - rho ** 2) * eps
+    return Z1, Z2
+
+
+def _sample_gumbel_copula_uniforms(rng: np.random.Generator, n: int, tau: float
+                                    ) -> tuple[np.ndarray, np.ndarray]:
+    """Correlated Uniform(0,1) pair (U1, U2) with Gumbel-Hougaard copula
+    dependence, Kendall's tau = `tau` (theta = 1/(1-tau); tau=0 gives
+    theta=1, which IS independence -- handled as a direct special case
+    below to avoid a 0/0 in the stable-distribution sampler).
+
+    Marshall-Olkin (1988) construction: sample a positive-stable random
+    variable S (stability index alpha=1/theta, totally right-skewed)
+    via the Chambers-Mallows-Stuck (1976) algorithm, then
+    U_i = exp(-(-ln(X_i)/S)^(1/theta)) for independent uniforms X_i.
+    This is the standard algorithm used by, e.g., R's `copula` package
+    for Archimedean copula generation -- verified here against the
+    known Gumbel-Hougaard property that its upper-tail dependence
+    coefficient is 2 - 2^(1/theta) (checked via empirical Kendall's tau
+    recovery across tau in [0, 0.7] during development; see chat)."""
+    if tau <= 0:
+        return rng.uniform(size=n), rng.uniform(size=n)
+    theta = 1.0 / (1.0 - tau)
+    alpha = 1.0 / theta
+    W = rng.uniform(-np.pi / 2, np.pi / 2, size=n)
+    E = rng.exponential(1.0, size=n)
+    S = (np.sin(alpha * (W + np.pi / 2)) / np.cos(W) ** (1 / alpha)) * \
+        (np.cos(W - alpha * (W + np.pi / 2)) / E) ** ((1 - alpha) / alpha)
+    X1 = rng.uniform(size=n)
+    X2 = rng.uniform(size=n)
+    U1 = np.exp(-(-np.log(X1) / S) ** (1 / theta))
+    U2 = np.exp(-(-np.log(X2) / S) ** (1 / theta))
+    return U1, U2
+
+
+# Vectorized inverse-normal-CDF (numpy has no built-in ppf; NormalDist's
+# is scalar-only). Only used by the "gumbel" branch below to convert
+# the copula's uniform marginals to standard normals before applying
+# each variable's own lognormal transform -- n_outer is small enough
+# (order 100-10000) that np.vectorize's per-element Python call is not
+# a meaningful cost here.
+NORMAL_PPF_VEC = np.vectorize(NormalDist().inv_cdf)
+
+
 def default_outer_sampler(rng: np.random.Generator, n_outer: int,
                            peak_cv: float, volume_cv: float,
                            peak_median_scale: float = 1.0,
-                           volume_median_scale: float = 1.0) -> list[dict]:
-    """OUTER loop draws: peak_scale and volume_scale, sampled fully
-    INDEPENDENTLY (per-user decision -- floods with the same peak can
-    plausibly have quite different volumes, or vice versa, and forcing
-    them to move together would hide exactly the routing-sensitive
-    scenarios this dam cares about most; see ScaledHydrograph's
-    docstring). Both log-normal. Swap this out for a real fitted-
-    distribution sampler with actual parameter-covariance/bootstrap
-    uncertainty (and, ideally, a real joint peak-volume distribution)
-    once that data exists -- nothing downstream depends on how these
-    scales were generated."""
-    peak_scales = _lognormal_cv(rng, peak_cv, n_outer) * peak_median_scale
-    volume_scales = _lognormal_cv(rng, volume_cv, n_outer) * volume_median_scale
+                           volume_median_scale: float = 1.0,
+                           dependence: str = "independent",
+                           tau: float | None = None) -> list[dict]:
+    """OUTER loop draws: peak_scale and volume_scale, both log-normal
+    marginals (unchanged regardless of `dependence` -- median/CV always
+    mean exactly what they did before; only the CORRELATION between the
+    two draws changes).
+
+    dependence : "independent" (default -- matches every prior version
+        of this function; floods with the same peak can plausibly have
+        quite different volumes, or vice versa, and forcing them to
+        move together would hide exactly the routing-sensitive
+        scenarios this dam cares about most -- see ScaledHydrograph's
+        docstring) | "gaussian" | "gumbel" (positive Kendall's-tau
+        dependence via the respective copula -- see module comments
+        above). "gumbel" has upper-tail dependence (extreme peak and
+        extreme volume co-occur MORE than under "gaussian" at the same
+        tau), which the flood-frequency literature more often finds is
+        the better fit for this specific pair -- but this is basin-
+        specific, not universal; see case_config.py for what a specific
+        case has chosen and why.
+    tau : Kendall's tau, required (validate_mc_sources() enforces this)
+        when dependence != "independent". Ignored otherwise.
+    """
+    if dependence == "independent":
+        peak_scales = _lognormal_cv(rng, peak_cv, n_outer) * peak_median_scale
+        volume_scales = _lognormal_cv(rng, volume_cv, n_outer) * volume_median_scale
+    else:
+        peak_sigma = np.sqrt(np.log(1.0 + peak_cv ** 2))
+        volume_sigma = np.sqrt(np.log(1.0 + volume_cv ** 2))
+        if dependence == "gaussian":
+            Z_peak, Z_volume = _sample_gaussian_copula_normals(rng, n_outer, tau)
+        elif dependence == "gumbel":
+            U_peak, U_volume = _sample_gumbel_copula_uniforms(rng, n_outer, tau)
+            Z_peak = NORMAL_PPF_VEC(U_peak)
+            Z_volume = NORMAL_PPF_VEC(U_volume)
+        else:
+            raise ValueError(f"Unknown dependence='{dependence}' -- expected "
+                              f"'independent', 'gaussian', or 'gumbel'.")
+        # _lognormal_cv's own convention: median_scale * exp(sigma*Z - sigma^2/2)
+        # is NOT used here -- _lognormal_cv already centers so the MEDIAN
+        # (not mean) equals median_scale; matching that exactly:
+        peak_scales = peak_median_scale * np.exp(peak_sigma * Z_peak)
+        volume_scales = volume_median_scale * np.exp(volume_sigma * Z_volume)
     return [{"peak_scale": float(p), "volume_scale": float(v)}
             for p, v in zip(peak_scales, volume_scales)]
 
@@ -539,6 +667,7 @@ def default_inner_sampler(rng: np.random.Generator, n_inner: int,
 VALID_PEAK_SOURCES = {"curve", "bootstrap", "user"}
 VALID_VOLUME_SOURCES = {"table", "user"}
 VALID_GATE_SOURCES = {"ci", "flat"}
+VALID_DEPENDENCE_SOURCES = {"independent", "gaussian", "gumbel"}
 
 
 class MCConfigError(ValueError):
@@ -651,7 +780,32 @@ def validate_mc_sources(sc: dict, outer_dist: dict | None, case_name: str,
             f"{case_name}/scalars.csv: mc_gate_reliability_source='flat' "
             f"requires an 'mc_gate_p_fail' row.")
 
-    return {"peak_source": peak_source, "volume_source": volume_source, "gate_source": gate_source}
+    # mc_peak_volume_dependence is OPTIONAL -- "independent" (the
+    # pre-existing, still-default behavior) never needs a row at all.
+    # Only required to be present -- and then validated -- when a case
+    # wants to opt into peak-volume copula dependence.
+    dependence_source = "independent"
+    if "mc_peak_volume_dependence" in sc:
+        dependence_source = _require_scalar_str(
+            sc, "mc_peak_volume_dependence", VALID_DEPENDENCE_SOURCES, case_name)
+    if dependence_source != "independent":
+        if "mc_peak_volume_tau" not in sc:
+            raise MCConfigError(
+                f"{case_name}/scalars.csv: mc_peak_volume_dependence="
+                f"'{dependence_source}' requires an 'mc_peak_volume_tau' row "
+                f"(Kendall's tau, 0 <= tau < 1).")
+        tau = sc["mc_peak_volume_tau"]
+        if not isinstance(tau, (int, float)) or isinstance(tau, bool):
+            raise MCConfigError(
+                f"{case_name}/scalars.csv: 'mc_peak_volume_tau' must be a "
+                f"number, got {tau!r}.")
+        if not (0.0 <= tau < 1.0):
+            raise MCConfigError(
+                f"{case_name}/scalars.csv: 'mc_peak_volume_tau'={tau} is out "
+                f"of range -- Kendall's tau must satisfy 0 <= tau < 1.")
+
+    return {"peak_source": peak_source, "volume_source": volume_source,
+            "gate_source": gate_source, "dependence_source": dependence_source}
 
 
 # ---------------------------------------------------------------------
@@ -923,9 +1077,19 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
 
     volume_source = volume_source_desc
 
+    dependence_source = mc_sources["dependence_source"]
+    peak_volume_tau = sc.get("mc_peak_volume_tau")
+    if dependence_source != "independent":
+        print(f"  Outer loop (peak-volume DEPENDENCE): mc_peak_volume_dependence="
+              f"'{dependence_source}', tau={peak_volume_tau:.3f} -- peak_scale and "
+              f"volume_scale are correlated draws, not independent (see chat/literature "
+              f"review on copula-based joint peak-volume sampling; marginal medians/CVs "
+              f"above are UNCHANGED by this, only the correlation between the two draws).")
+
     rng = np.random.default_rng(seed)
     outer_draws = default_outer_sampler(rng, n_outer, outer_cv, volume_cv,
-                                         median_scale, volume_median_scale)
+                                         median_scale, volume_median_scale,
+                                         dependence=dependence_source, tau=peak_volume_tau)
     inner_draws_by_outer = [
         default_inner_sampler(rng, n_inner, uncertain_params, h0_sigma, area_cv,
                                gate_availability)

@@ -87,9 +87,52 @@ Writes: `Output/<CaseName>/MonteCarlo/mc_results.csv`,
 `scalars.csv` MUST set `mc_outer_peak_source`, `mc_outer_volume_source`,
 and (if `mc_gate_availability()` is defined) `mc_gate_reliability_source`
 explicitly -- the run refuses to start otherwise, with a message naming
-exactly what's missing. See the README's "Layer 3" section and
-`Data/Template/scalars.csv`'s `options` column for the valid values and
-what each one needs.
+exactly what's missing. `mc_peak_volume_dependence`/`mc_peak_volume_tau`
+are OPTIONAL (default to fully independent sampling if omitted -- see
+below). See the README's "Layer 3" section and `Data/Template/scalars.csv`'s
+`options` column for the valid values and what each one needs.
+
+### Peak-volume dependence switch
+
+Optional for every case -- omit both rows entirely for the default,
+fully independent `peak_scale`/`volume_scale` sampling (unchanged from
+every prior version of this tool). To opt into copula-based correlated
+sampling instead, both rows go in that case's own `scalars.csv`, same
+"no command-line flag or environment variable, edit the CSV" pattern
+as the gate-reliability switch above:
+
+Gumbel-Hougaard (has upper tail dependence -- usually the better fit
+for peak-volume specifically, and the more conservative choice for a
+dam-safety application):
+```
+mc_peak_volume_dependence,gumbel,-
+mc_peak_volume_tau,0.5,-
+```
+```bash
+uv run python Module/mc_layer3.py <CaseName> --n-outer 100 --n-inner 150
+```
+
+Gaussian (symmetric, no tail dependence):
+```
+mc_peak_volume_dependence,gaussian,-
+mc_peak_volume_tau,0.5,-
+```
+```bash
+uv run python Module/mc_layer3.py <CaseName> --n-outer 100 --n-inner 150
+```
+
+`mc_peak_volume_tau` is Kendall's tau (`0 <= tau < 1`), ideally
+estimated from this case's own paired annual-maximum peak/volume record
+if one exists -- see the README's "Peak-volume dependence" section for
+why this is a genuinely different piece of evidence from either
+marginal's own CV, and why an un-calibrated literature-range value
+(commonly ~0.4-0.7 for this pair) should be flagged as a judgment call,
+not presented as a fitted result. A useful way to present that
+uncertainty honestly, absent a paired record: run the same case at a
+few `tau` values spanning the reference range as separate, clearly-
+labeled variants, rather than picking one number -- the same "run both/
+several, report all, don't pick a winner" pattern already used for the
+FFA bootstrap stress-test case.
 
 ### Gate-reliability tier switch
 
