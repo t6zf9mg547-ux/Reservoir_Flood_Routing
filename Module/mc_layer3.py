@@ -1071,9 +1071,10 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
             volume_cv = derived_volume_cv
             volume_source_desc = ("table (median: this case's own inflow_hydrograph.csv, "
                                    "unchanged; spread: flood_duration_volume_table, real data)")
-        print(f"  Outer loop (volume, INDEPENDENT of peak): mc_outer_volume_source='table' "
-              f"-- median stays at this case's own hydrograph volume (volume_duration_csv "
-              f"used for CV only), cv={volume_cv:.4f} ({volume_source_desc})")
+        print(f"  Outer loop (volume): mc_outer_volume_source='table' -- median stays at this "
+              f"case's own hydrograph volume (volume_duration_csv used for CV only), "
+              f"cv={volume_cv:.4f} ({volume_source_desc}); see mc_peak_volume_dependence below "
+              f"for whether the draws are actually correlated with peak")
 
     volume_source = volume_source_desc
 
@@ -1167,6 +1168,7 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
         "uncertain_params": uncertain_params,
         "gate_availability": gate_availability,
         "gate_source": mc_sources["gate_source"],
+        "dependence_source": dependence_source, "peak_volume_tau": peak_volume_tau,
         "seed": seed,
     }
     return records, meta
@@ -1342,10 +1344,20 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
             f.write(f"Outer-loop target return period: {meta['target_return_period']} years "
                     f"(median hydrograph PEAK scale factor: {meta['median_scale']:.4f})\n")
         f.write(f"Outer-loop PEAK scale CV: {meta['outer_cv']:.4f}\n")
-        f.write(f"Outer-loop source (volume, sampled INDEPENDENTLY of peak): "
-                f"{meta['volume_source']}\n")
+        f.write(f"Outer-loop source (volume -- median/CV derived independently of the peak "
+                f"marginal's own derivation, see mc_peak_volume_dependence below for whether "
+                f"the DRAWS are actually correlated): {meta['volume_source']}\n")
         f.write(f"Outer-loop median VOLUME scale factor: {meta['volume_median_scale']:.4f}, "
                 f"CV: {meta['volume_cv']:.4f}\n")
+        if meta["dependence_source"] != "independent":
+            f.write(f"Outer-loop peak-volume DEPENDENCE: mc_peak_volume_dependence="
+                    f"'{meta['dependence_source']}', tau={meta['peak_volume_tau']:.3f} -- "
+                    f"peak_scale and volume_scale draws ARE correlated (see "
+                    f"_sample_gaussian_copula_normals()/_sample_gumbel_copula_uniforms() "
+                    f"docstrings); marginal medians/CVs above are unaffected by this.\n")
+        else:
+            f.write(f"Outer-loop peak-volume DEPENDENCE: independent (default) -- peak_scale "
+                    f"and volume_scale draws are NOT correlated.\n")
         f.write(f"Inner-loop H0 sigma [m]: {meta['h0_sigma']}, "
                 f"reservoir area_scale CV: {meta['area_cv']}\n")
         f.write(f"Inner-loop uncertain physical params: "
