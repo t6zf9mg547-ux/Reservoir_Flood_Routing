@@ -44,9 +44,10 @@ python Module/validate_against_original.py Template
     dam_crest_level, max_flood_level (see "Safety thresholds" below).
     Also where Layer 3's mandatory `mc_outer_peak_source`/
     `mc_outer_volume_source`/`mc_gate_reliability_source` selections,
-    and the optional `mc_peak_volume_dependence`/`mc_peak_volume_tau`
-    pair, live (see "Layer 3" below) -- required only if you run
-    Layer 3 for this case, irrelevant to Layer 1/2
+    the optional `mc_peak_volume_dependence`/`mc_peak_volume_tau`
+    pair, and the optional `mc_outer_hydrograph_source` switch live
+    (see "Layer 3" below) -- required only if you run Layer 3 for this
+    case, irrelevant to Layer 1/2
   - `case_config.py` : the ONE file where you define which outlets
     exist and their parameters/operating rules (see below)
 
@@ -355,11 +356,14 @@ with slightly different, still-realistic inputs, and reports the
 resulting distribution rather than one number.
 
 **Two nested loops, deliberately kept separate:**
-- **Outer loop** -- "which flood magnitude are we facing": draws a
-  peak scale factor and a volume scale factor, applied to this case's
-  own `inflow_hydrograph.csv`. Independent by default (see "Peak-volume
+- **Outer loop** -- "which flood magnitude are we facing": by default
+  (`mc_outer_hydrograph_source="scaled"`), draws a peak scale factor
+  and a volume scale factor, applied to this case's own
+  `inflow_hydrograph.csv`. Independent by default (see "Peak-volume
   dependence" below) -- optionally correlated via a copula if a case
-  opts in.
+  opts in. A case can opt into a fundamentally different, EMPIRICAL
+  alternative instead (`mc_outer_hydrograph_source="ensemble"`) --
+  see "Empirical hydrograph ensembles" below.
 - **Inner loop** -- "how do the physical structures perform, for a
   fixed flood": for each outer draw, re-runs the simulation many times,
   varying discharge/rating coefficients, the reservoir's initial level
@@ -502,6 +506,61 @@ touch how the median or CV of either marginal was derived. See
 `Module/mc_layer3.py`'s `_sample_gaussian_copula_normals()`/
 `_sample_gumbel_copula_uniforms()` docstrings for the sampling
 algorithms (Marshall-Olkin/Chambers-Mallows-Stuck for Gumbel).
+
+**Empirical hydrograph ensembles:** everything above (`mc_outer_peak_source`,
+`mc_outer_volume_source`, `mc_peak_volume_dependence`) is a PARAMETRIC
+approach -- a marginal CV for each of peak and volume, and, if
+correlated draws are wanted, a copula family plus a `tau` that's often
+an unfitted literature-range guess absent a paired record. A case can
+opt into a fundamentally different, EMPIRICAL alternative instead:
+
+```
+mc_outer_hydrograph_source,ensemble,-
+```
+
+OPTIONAL, defaults to `"scaled"` (everything above, unchanged) if the
+row is omitted -- every case built before this option existed keeps
+working exactly as it always has. When set to `"ensemble"`,
+`mc_outer_peak_source`/`mc_outer_volume_source`/`mc_peak_volume_dependence`
+are NOT read or required at all -- each outer scenario instead uses a
+WHOLE, already-coherent hydrograph pulled directly from a pre-generated
+ensemble file, via `mc_outer_distribution()`'s new `ensemble_csv` key
+(a wide CSV: `Time_hours,rep_1,rep_2,...,rep_N`, one row per timestep,
+one column per replicate).
+
+The motivating case: the companion `Design_Flood_IIUNAM` project's
+`Module/task7_hydrograph_ensemble.py`, which generates hundreds of
+individually-coherent hydrographs via year-block bootstrap of an
+annual-maximum record (the same resampled year driving every duration
+at once, so peak, volume, AND shape stay correlated correctly and
+EMPIRICALLY in every replicate -- not from an assumed copula parameter).
+Its own wide-format hourly CSV output is exactly this section's
+`ensemble_csv` format, ready to point at directly with no conversion.
+Each outer scenario draws a DIFFERENT replicate, WITHOUT replacement,
+so every scenario stays genuinely independent -- this project's own
+SE/convergence calculations (`_cluster_bootstrap_stats()`, Eq.176/177)
+assume `n_outer` independent scenarios, and resampling with replacement
+would silently reintroduce duplicates and undermine that (the same
+class of bug this project already found and fixed once, for the
+nested outer/inner draw structure itself). If a run requests more
+`n_outer` than the ensemble has replicates, Layer 3 CAPS `n_outer` at
+the available count and prints a clear warning, rather than either
+erroring outright or silently resampling with replacement -- generate
+more replicates from `Design_Flood_IIUNAM`'s Task 7 if you need more
+than that.
+
+`peak_scale`/`volume_scale` still appear in `mc_results.csv`/
+`mc_summary.txt` in this mode, for compatibility with existing
+plotting/analysis tooling -- but they're EMPIRICAL, INFORMATIONAL
+summary statistics of the selected replicates relative to this case's
+own `inflow_hydrograph.csv`, not sampling inputs; the actual forcing
+hydrograph for each outer scenario is the ensemble replicate itself,
+used directly, never reconstructed from those ratios. See
+`Data/Template/case_config.py`'s
+`mc_outer_hydrograph_source="ensemble"` comments for a worked
+`mc_outer_distribution()` example, and `Module/mc_layer3.py`'s
+`load_hydrograph_ensemble()`/`select_ensemble_hydrographs()`/
+`EnsembleHydrograph` docstrings for the implementation.
 
 **Opting a case into real CV data, on top of the mandatory source
 selection above:** `mc_uncertain_params()` and `mc_outer_distribution()`

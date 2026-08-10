@@ -136,6 +136,24 @@ AREA_DEFAULT_CV = 0.05    # default reservoir stage-storage curve
 # re-reading CSVs thousands of times.
 # ---------------------------------------------------------------------
 
+class EnsembleHydrograph:
+    """A single ensemble replicate used DIRECTLY as an outer scenario's
+    forcing hydrograph -- mc_outer_hydrograph_source="ensemble" mode.
+    Same minimal interface ScaledHydrograph/Hydrograph expose to the
+    rest of this file (.t, .Q, .discharge(t) via linear interpolation,
+    zero outside the tabulated range -- same convention as the real
+    Hydrograph class) -- but built directly from an in-memory (t, Q)
+    pair instead of a CSV path, since load_hydrograph_ensemble() reads
+    hundreds of replicates from ONE file and there's no reason to
+    round-trip each one through disk."""
+    def __init__(self, t: np.ndarray, Q: np.ndarray):
+        self.t = t
+        self.Q = Q
+
+    def discharge(self, t):
+        return np.interp(t, self.t, self.Q, left=0.0, right=0.0)
+
+
 class ScaledHydrograph:
     """Wraps a Hydrograph, giving INDEPENDENT control over peak and
     volume. Flood volume is a first-order control on routed reservoir
@@ -376,6 +394,88 @@ def derive_outer_cv_from_bootstrap_ci(ci_T: np.ndarray, ci_lower: np.ndarray,
     sigma = float((sigma_upper + sigma_lower) / 2.0)
     cv = float(np.sqrt(np.exp(sigma ** 2) - 1.0))
     return anchor_Q, cv
+
+
+# ---------------------------------------------------------------------
+# Empirical hydrograph ensembles (mc_outer_hydrograph_source="ensemble")
+# ---------------------------------------------------------------------
+# WHY this exists: the "scaled" mode (default, everything above) draws
+# a peak_scale/volume_scale PAIR and applies it to this case's own
+# inflow_hydrograph.csv via ScaledHydrograph -- a PARAMETRIC approach
+# that needs a marginal CV for each of peak/volume, and, if correlated
+# draws are wanted, a copula family + a Kendall's tau that's usually an
+# unfitted literature-range guess (see the copula section below). An
+# ensemble of pre-generated, individually-coherent hydrographs -- e.g.
+# from a year-block bootstrap of an annual-maximum record, refit and
+# re-disaggregated per replicate, such that the SAME resampled year
+# drives every duration at once -- sidesteps all of that: peak, volume,
+# AND shape are already correlated correctly and EMPIRICALLY in every
+# replicate, from the actual resampling mechanism, not an assumed
+# copula parameter. "ensemble" mode uses each selected replicate
+# DIRECTLY as that outer scenario's forcing hydrograph -- no
+# ScaledHydrograph, no marginal CV, no copula.
+
+def load_hydrograph_ensemble(path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Reads a wide-format hydrograph ensemble CSV:
+        Time_hours,rep_1,rep_2,...,rep_N
+    one row per timestep, one column per replicate (e.g. produced by a
+    companion tool's year-block-bootstrap hydrograph/hyetograph
+    ensemble generator). Returns (t_seconds, Q_matrix, rep_names):
+        t_seconds -- 1D array, length n_timesteps, converted from the
+            file's own hours to this project's SI (seconds) convention.
+        Q_matrix  -- 2D array, shape (n_replicates, n_timesteps) -- one
+            row per replicate, ready to index directly by replicate.
+        rep_names -- the original column headers (e.g. "rep_1"), same
+            order as Q_matrix's rows, kept for traceability in
+            mc_summary.txt/records (which replicate ended up in which
+            outer scenario)."""
+    with open(path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rep_names = header[1:]
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"{path}: no data rows (header only).")
+    t_hours = np.array([float(row[0]) for row in rows])
+    Q_matrix = np.array([[float(row[i + 1]) for row in rows]
+                          for i in range(len(rep_names))])
+    return t_hours * 3600.0, Q_matrix, rep_names
+
+
+def select_ensemble_hydrographs(rng: np.random.Generator, n_outer: int,
+                                 n_replicates: int, case_name: str
+                                 ) -> tuple[np.ndarray, int]:
+    """Selects which of an ensemble's replicates become this run's
+    n_outer outer scenarios -- WITHOUT replacement (each replicate used
+    at most once), so every outer scenario stays genuinely independent;
+    _cluster_bootstrap_stats()'s SE calculations and the Eq.176/177
+    convergence checks both assume n_outer INDEPENDENT scenarios --
+    resampling WITH replacement would silently reintroduce duplicate
+    scenarios and the exact class of overstated-precision bug this
+    project already found and fixed once for the nested outer/inner
+    draw structure itself (see chat).
+
+    If n_outer > n_replicates, this is a HARD CAP, not a silent
+    reduction -- n_outer is reduced to n_replicates and a clear warning
+    is printed (and returned as the actual n_outer used) so the
+    caller's own "Draws: X outer x Y inner" reporting stays honest
+    about what actually ran, rather than claiming a draw count that
+    didn't happen.
+
+    Returns (selected_indices, actual_n_outer)."""
+    actual_n_outer = n_outer
+    if n_outer > n_replicates:
+        print(f"  WARNING: {case_name} requested n_outer={n_outer} but the "
+              f"ensemble only has {n_replicates} replicates. Capping at "
+              f"n_outer={n_replicates} -- resampling with replacement was "
+              f"deliberately NOT done here, since duplicate outer scenarios "
+              f"would silently violate the independence this project's own "
+              f"convergence/SE calculations assume. Generate more replicates "
+              f"from the ensemble tool if you need more than {n_replicates} "
+              f"outer draws.")
+        actual_n_outer = n_replicates
+    selected = rng.choice(n_replicates, size=actual_n_outer, replace=False)
+    return selected, actual_n_outer
 
 
 # ---------------------------------------------------------------------
@@ -668,6 +768,7 @@ VALID_PEAK_SOURCES = {"curve", "bootstrap", "user"}
 VALID_VOLUME_SOURCES = {"table", "user"}
 VALID_GATE_SOURCES = {"ci", "flat"}
 VALID_DEPENDENCE_SOURCES = {"independent", "gaussian", "gumbel"}
+VALID_HYDROGRAPH_SOURCES = {"scaled", "ensemble"}
 
 
 class MCConfigError(ValueError):
@@ -725,6 +826,45 @@ def validate_mc_sources(sc: dict, outer_dist: dict | None, case_name: str,
         hook later), its VALUE is still validated -- a stray typo
         shouldn't silently pass just because it's currently unused --
         it's only the row's ABSENCE that's tolerated in that case."""
+    # mc_outer_hydrograph_source is OPTIONAL -- "scaled" (the
+    # pre-existing, still-default behavior: this case's own
+    # inflow_hydrograph.csv + peak_scale/volume_scale via
+    # ScaledHydrograph) never needs a row at all. "ensemble" opts a
+    # case into drawing whole, already-coherent hydrographs directly
+    # from a pre-generated ensemble file instead -- see
+    # load_hydrograph_ensemble()'s docstring for why this is a
+    # fundamentally different, EMPIRICAL alternative to the
+    # peak_scale/volume_scale/copula machinery below, not another
+    # option layered onto it: in "ensemble" mode,
+    # mc_outer_peak_source/mc_outer_volume_source/
+    # mc_peak_volume_dependence are NOT read or required at all --
+    # requiring them would be pointless busywork for values that
+    # wouldn't do anything.
+    hydrograph_source = "scaled"
+    if "mc_outer_hydrograph_source" in sc:
+        hydrograph_source = _require_scalar_str(
+            sc, "mc_outer_hydrograph_source", VALID_HYDROGRAPH_SOURCES, case_name)
+
+    if hydrograph_source == "ensemble":
+        if outer_dist is None or "ensemble_csv" not in outer_dist:
+            raise MCConfigError(
+                f"{case_name}: mc_outer_hydrograph_source='ensemble' requires "
+                f"mc_outer_distribution() to return an 'ensemble_csv' key "
+                f"(a wide-format Time_hours,rep_1,rep_2,... CSV).")
+        if has_gate_hook:
+            gate_source = _require_scalar_str(sc, "mc_gate_reliability_source", VALID_GATE_SOURCES, case_name)
+        elif "mc_gate_reliability_source" in sc:
+            gate_source = _require_scalar_str(sc, "mc_gate_reliability_source", VALID_GATE_SOURCES, case_name)
+        else:
+            gate_source = None
+        if gate_source == "flat" and "mc_gate_p_fail" not in sc:
+            raise MCConfigError(
+                f"{case_name}/scalars.csv: mc_gate_reliability_source='flat' "
+                f"requires an 'mc_gate_p_fail' row.")
+        return {"hydrograph_source": "ensemble", "peak_source": None,
+                "volume_source": None, "dependence_source": None,
+                "gate_source": gate_source}
+
     peak_source = _require_scalar_str(sc, "mc_outer_peak_source", VALID_PEAK_SOURCES, case_name)
     volume_source = _require_scalar_str(sc, "mc_outer_volume_source", VALID_VOLUME_SOURCES, case_name)
     if has_gate_hook:
@@ -804,8 +944,9 @@ def validate_mc_sources(sc: dict, outer_dist: dict | None, case_name: str,
                 f"{case_name}/scalars.csv: 'mc_peak_volume_tau'={tau} is out "
                 f"of range -- Kendall's tau must satisfy 0 <= tau < 1.")
 
-    return {"peak_source": peak_source, "volume_source": volume_source,
-            "gate_source": gate_source, "dependence_source": dependence_source}
+    return {"hydrograph_source": "scaled", "peak_source": peak_source,
+            "volume_source": volume_source, "gate_source": gate_source,
+            "dependence_source": dependence_source}
 
 
 # ---------------------------------------------------------------------
@@ -964,133 +1105,181 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
     t_max, dt = sc["t_max"], sc["dt"]
     print_every = int(sc.get("print_every", 1))
 
-    # Every case explicitly declares, via scalars.csv, which source
-    # drives the peak loop, the volume loop, and gate reliability --
-    # validate_mc_sources() (called inside build_case()) already
-    # enforced that the declared source and the data/scalars it needs
-    # are both present; a case that's missing either fails BEFORE
-    # reaching this point, not partway through a run. What follows is
-    # a straight branch on that explicit choice -- no inference, no
-    # "does this file happen to exist" fallback chain.
-    explicit_peak_cv = sc.get("mc_outer_peak_cv")
-    explicit_volume_cv = sc.get("mc_outer_volume_cv")
-    peak_source = mc_sources["peak_source"]
-    volume_source = mc_sources["volume_source"]
-    target_return_period = outer_dist.get("target_return_period") if outer_dist else None
-
-    # inflow_hydrograph.csv IS the design hydrograph -- its own peak and
-    # volume are always the median (median_scale = volume_median_scale
-    # = 1.0), for every source EXCEPT "bootstrap". curve_csv/
-    # alt_studies_csv and volume_duration_csv are CV-ONLY inputs here:
-    # they never recompute the anchor away from the case's own
-    # hydrograph, because that hydrograph already IS the T-year design
-    # flood, not an approximation of one that external files should
-    # correct. "bootstrap" is the deliberate exception -- an FFA
-    # stress-test case's whole point is that the FFA tool's own median
-    # is a genuinely different, disputed central estimate (see
-    # FFA_Integration.md), not a refinement of the hydrograph's.
-    if peak_source == "user":
-        median_scale = 1.0
-        outer_cv = explicit_peak_cv
-        outer_source = ("user (mc_outer_peak_source='user' -- no curve data used; "
-                         f"cv={outer_cv:.4f} is a pure case-level judgment call)")
-
-    elif peak_source == "curve":
-        curve_T, curve_Q = load_flood_frequency_curve(outer_dist["curve_csv"])
-        derived_cv = derive_outer_cv_from_alt_studies(
-            curve_T, curve_Q, outer_dist["alt_studies_csv"])
-        if derived_cv is None:
-            raise MCConfigError(
-                f"{case_name}: mc_outer_peak_source='curve' but "
-                f"alt_studies_csv has fewer than 2 rows -- not enough to "
-                f"derive a CV from. Add more rows, or switch to "
-                f"mc_outer_peak_source='user' with an explicit mc_outer_peak_cv.")
-        median_scale = 1.0
-        if explicit_peak_cv is not None:
-            outer_cv = explicit_peak_cv
-            outer_source = ("curve (median: this case's own inflow_hydrograph.csv, "
-                             "unchanged) + explicit mc_outer_peak_cv override "
-                             f"(spread: case-level judgment, NOT the alt_studies-"
-                             f"derived {derived_cv:.4f})")
-        else:
-            outer_cv = derived_cv
-            outer_source = ("curve (median: this case's own inflow_hydrograph.csv, "
-                             "unchanged; spread: alt_studies, real data)")
-        print(f"  Outer loop (peak): mc_outer_peak_source='curve' -- median stays "
-              f"at this case's own hydrograph peak (curve_csv/alt_studies_csv used "
-              f"for CV only), cv={outer_cv:.4f} ({outer_source})")
-
-    elif peak_source == "bootstrap":
-        ci_T, ci_lower, ci_median, ci_upper = load_bootstrap_ci_curve(outer_dist["bootstrap_ci_csv"])
-        ci_confidence = outer_dist.get("bootstrap_ci_confidence", 0.95)
-        anchor_Q, derived_cv = derive_outer_cv_from_bootstrap_ci(
-            ci_T, ci_lower, ci_median, ci_upper, target_return_period, ci_confidence)
-        base_peak = float(max(inflow_base.Q))
-        median_scale = anchor_Q / base_peak
-        if explicit_peak_cv is not None:
-            outer_cv = explicit_peak_cv
-            outer_source = ("bootstrap (median: FFA bootstrap_ci_csv, DIFFERENT from "
-                             "this case's own hydrograph peak by design -- the whole "
-                             "point of this stress-test case) + explicit "
-                             f"mc_outer_peak_cv override (spread: case-level judgment, "
-                             f"NOT the bootstrap-derived {derived_cv:.4f})")
-        else:
-            outer_cv = derived_cv
-            outer_source = (f"bootstrap (median AND spread both from FFA bootstrap_ci_csv "
-                             f"at {ci_confidence:.0%} CI -- see FFA_Integration.md; median "
-                             f"DELIBERATELY differs from this case's own hydrograph peak, "
-                             f"this is almost always a stress-test case, not the primary case)")
-        print(f"  Outer loop (peak): mc_outer_peak_source='bootstrap', targeting "
-              f"T={target_return_period}-yr flood, bootstrap median={anchor_Q:.0f} m3/s vs. "
-              f"this case's own hydrograph peak={base_peak:.0f} m3/s -> "
-              f"median scale={median_scale:.4f}, cv={outer_cv:.4f} ({outer_source})")
-
-    if volume_source == "user":
-        volume_median_scale = 1.0
-        volume_cv = explicit_volume_cv
-        volume_source_desc = ("user (mc_outer_volume_source='user' -- no duration/volume data "
-                               f"used; cv={volume_cv:.4f} is a pure case-level judgment call)")
-
-    elif volume_source == "table":
-        dv_T, dv_Q, dv_V = load_duration_volume_table(outer_dist["volume_duration_csv"])
-        derived_volume_cv = derive_volume_cv_from_duration_table(dv_T, dv_Q, dv_V)
-        if derived_volume_cv is None:
-            raise MCConfigError(
-                f"{case_name}: mc_outer_volume_source='table' but "
-                f"volume_duration_csv has fewer than 2 rows -- not enough to "
-                f"derive a CV from. Add more rows, or switch to "
-                f"mc_outer_volume_source='user' with an explicit mc_outer_volume_cv.")
-        volume_median_scale = 1.0
-        if explicit_volume_cv is not None:
-            volume_cv = explicit_volume_cv
-            volume_source_desc = ("table (median: this case's own inflow_hydrograph.csv, "
-                                   "unchanged) + explicit mc_outer_volume_cv override "
-                                   f"(spread: case-level judgment, NOT the table-derived "
-                                   f"{derived_volume_cv:.4f})")
-        else:
-            volume_cv = derived_volume_cv
-            volume_source_desc = ("table (median: this case's own inflow_hydrograph.csv, "
-                                   "unchanged; spread: flood_duration_volume_table, real data)")
-        print(f"  Outer loop (volume): mc_outer_volume_source='table' -- median stays at this "
-              f"case's own hydrograph volume (volume_duration_csv used for CV only), "
-              f"cv={volume_cv:.4f} ({volume_source_desc}); see mc_peak_volume_dependence below "
-              f"for whether the draws are actually correlated with peak")
-
-    volume_source = volume_source_desc
-
-    dependence_source = mc_sources["dependence_source"]
-    peak_volume_tau = sc.get("mc_peak_volume_tau")
-    if dependence_source != "independent":
-        print(f"  Outer loop (peak-volume DEPENDENCE): mc_peak_volume_dependence="
-              f"'{dependence_source}', tau={peak_volume_tau:.3f} -- peak_scale and "
-              f"volume_scale are correlated draws, not independent (see chat/literature "
-              f"review on copula-based joint peak-volume sampling; marginal medians/CVs "
-              f"above are UNCHANGED by this, only the correlation between the two draws).")
-
     rng = np.random.default_rng(seed)
-    outer_draws = default_outer_sampler(rng, n_outer, outer_cv, volume_cv,
-                                         median_scale, volume_median_scale,
-                                         dependence=dependence_source, tau=peak_volume_tau)
+
+    if mc_sources["hydrograph_source"] == "ensemble":
+        # EMPIRICAL mode: whole hydrographs drawn directly from a pre-
+        # generated ensemble, not the peak_scale/volume_scale/copula
+        # machinery below -- see load_hydrograph_ensemble()'s docstring.
+        t_ensemble, Q_matrix, rep_names = load_hydrograph_ensemble(outer_dist["ensemble_csv"])
+        n_replicates = Q_matrix.shape[0]
+        selected_idx, n_outer = select_ensemble_hydrographs(rng, n_outer, n_replicates, case_name)
+
+        base_peak = float(max(inflow_base.Q))
+        base_volume = float(np.trapezoid(inflow_base.Q, inflow_base.t))
+        outer_draws = []
+        for idx in selected_idx:
+            hydro = EnsembleHydrograph(t_ensemble, Q_matrix[idx])
+            rep_peak = float(Q_matrix[idx].max())
+            rep_volume = float(np.trapezoid(Q_matrix[idx], t_ensemble))
+            outer_draws.append({
+                "peak_scale": rep_peak / base_peak,      # informational only -- NOT
+                "volume_scale": rep_volume / base_volume,  # used to derive the hydrograph
+                "hydrograph": hydro,
+            })
+
+        informational_peaks = np.array([d["peak_scale"] for d in outer_draws])
+        informational_volumes = np.array([d["volume_scale"] for d in outer_draws])
+        median_scale = float(np.median(informational_peaks))
+        outer_cv = float(np.std(informational_peaks, ddof=1) / np.mean(informational_peaks)) \
+            if n_outer > 1 else 0.0
+        volume_median_scale = float(np.median(informational_volumes))
+        volume_cv = float(np.std(informational_volumes, ddof=1) / np.mean(informational_volumes)) \
+            if n_outer > 1 else 0.0
+        target_return_period = outer_dist.get("target_return_period")
+        outer_source = (f"ensemble ({n_outer} of {n_replicates} replicates used from "
+                         f"{outer_dist['ensemble_csv']}, drawn WITHOUT replacement -- each "
+                         f"used directly as its outer scenario's forcing hydrograph, not via "
+                         f"peak_scale/volume_scale on this case's own inflow_hydrograph.csv. "
+                         f"peak_scale/volume_scale below are EMPIRICAL, INFORMATIONAL summary "
+                         f"stats of the selected replicates relative to this case's own "
+                         f"hydrograph -- not sampling inputs.)")
+        volume_source = outer_source
+        dependence_source = "ensemble"  # not a copula choice -- correlation is inherent
+        peak_volume_tau = None
+        print(f"  Outer loop (hydrograph): mc_outer_hydrograph_source='ensemble' -- "
+              f"{n_outer} of {n_replicates} replicates used from {outer_dist['ensemble_csv']}, "
+              f"empirical peak_scale median={median_scale:.4f} (cv={outer_cv:.4f}), "
+              f"volume_scale median={volume_median_scale:.4f} (cv={volume_cv:.4f})")
+
+    else:
+        # Every case explicitly declares, via scalars.csv, which source
+        # drives the peak loop, the volume loop, and gate reliability --
+        # validate_mc_sources() (called inside build_case()) already
+        # enforced that the declared source and the data/scalars it needs
+        # are both present; a case that's missing either fails BEFORE
+        # reaching this point, not partway through a run. What follows is
+        # a straight branch on that explicit choice -- no inference, no
+        # "does this file happen to exist" fallback chain.
+        explicit_peak_cv = sc.get("mc_outer_peak_cv")
+        explicit_volume_cv = sc.get("mc_outer_volume_cv")
+        peak_source = mc_sources["peak_source"]
+        volume_source = mc_sources["volume_source"]
+        target_return_period = outer_dist.get("target_return_period") if outer_dist else None
+
+        # inflow_hydrograph.csv IS the design hydrograph -- its own peak and
+        # volume are always the median (median_scale = volume_median_scale
+        # = 1.0), for every source EXCEPT "bootstrap". curve_csv/
+        # alt_studies_csv and volume_duration_csv are CV-ONLY inputs here:
+        # they never recompute the anchor away from the case's own
+        # hydrograph, because that hydrograph already IS the T-year design
+        # flood, not an approximation of one that external files should
+        # correct. "bootstrap" is the deliberate exception -- an FFA
+        # stress-test case's whole point is that the FFA tool's own median
+        # is a genuinely different, disputed central estimate (see
+        # FFA_Integration.md), not a refinement of the hydrograph's.
+        if peak_source == "user":
+            median_scale = 1.0
+            outer_cv = explicit_peak_cv
+            outer_source = ("user (mc_outer_peak_source='user' -- no curve data used; "
+                             f"cv={outer_cv:.4f} is a pure case-level judgment call)")
+
+        elif peak_source == "curve":
+            curve_T, curve_Q = load_flood_frequency_curve(outer_dist["curve_csv"])
+            derived_cv = derive_outer_cv_from_alt_studies(
+                curve_T, curve_Q, outer_dist["alt_studies_csv"])
+            if derived_cv is None:
+                raise MCConfigError(
+                    f"{case_name}: mc_outer_peak_source='curve' but "
+                    f"alt_studies_csv has fewer than 2 rows -- not enough to "
+                    f"derive a CV from. Add more rows, or switch to "
+                    f"mc_outer_peak_source='user' with an explicit mc_outer_peak_cv.")
+            median_scale = 1.0
+            if explicit_peak_cv is not None:
+                outer_cv = explicit_peak_cv
+                outer_source = ("curve (median: this case's own inflow_hydrograph.csv, "
+                                 "unchanged) + explicit mc_outer_peak_cv override "
+                                 f"(spread: case-level judgment, NOT the alt_studies-"
+                                 f"derived {derived_cv:.4f})")
+            else:
+                outer_cv = derived_cv
+                outer_source = ("curve (median: this case's own inflow_hydrograph.csv, "
+                                 "unchanged; spread: alt_studies, real data)")
+            print(f"  Outer loop (peak): mc_outer_peak_source='curve' -- median stays "
+                  f"at this case's own hydrograph peak (curve_csv/alt_studies_csv used "
+                  f"for CV only), cv={outer_cv:.4f} ({outer_source})")
+
+        elif peak_source == "bootstrap":
+            ci_T, ci_lower, ci_median, ci_upper = load_bootstrap_ci_curve(outer_dist["bootstrap_ci_csv"])
+            ci_confidence = outer_dist.get("bootstrap_ci_confidence", 0.95)
+            anchor_Q, derived_cv = derive_outer_cv_from_bootstrap_ci(
+                ci_T, ci_lower, ci_median, ci_upper, target_return_period, ci_confidence)
+            base_peak = float(max(inflow_base.Q))
+            median_scale = anchor_Q / base_peak
+            if explicit_peak_cv is not None:
+                outer_cv = explicit_peak_cv
+                outer_source = ("bootstrap (median: FFA bootstrap_ci_csv, DIFFERENT from "
+                                 "this case's own hydrograph peak by design -- the whole "
+                                 "point of this stress-test case) + explicit "
+                                 f"mc_outer_peak_cv override (spread: case-level judgment, "
+                                 f"NOT the bootstrap-derived {derived_cv:.4f})")
+            else:
+                outer_cv = derived_cv
+                outer_source = (f"bootstrap (median AND spread both from FFA bootstrap_ci_csv "
+                                 f"at {ci_confidence:.0%} CI -- see FFA_Integration.md; median "
+                                 f"DELIBERATELY differs from this case's own hydrograph peak, "
+                                 f"this is almost always a stress-test case, not the primary case)")
+            print(f"  Outer loop (peak): mc_outer_peak_source='bootstrap', targeting "
+                  f"T={target_return_period}-yr flood, bootstrap median={anchor_Q:.0f} m3/s vs. "
+                  f"this case's own hydrograph peak={base_peak:.0f} m3/s -> "
+                  f"median scale={median_scale:.4f}, cv={outer_cv:.4f} ({outer_source})")
+
+        if volume_source == "user":
+            volume_median_scale = 1.0
+            volume_cv = explicit_volume_cv
+            volume_source_desc = ("user (mc_outer_volume_source='user' -- no duration/volume data "
+                                   f"used; cv={volume_cv:.4f} is a pure case-level judgment call)")
+
+        elif volume_source == "table":
+            dv_T, dv_Q, dv_V = load_duration_volume_table(outer_dist["volume_duration_csv"])
+            derived_volume_cv = derive_volume_cv_from_duration_table(dv_T, dv_Q, dv_V)
+            if derived_volume_cv is None:
+                raise MCConfigError(
+                    f"{case_name}: mc_outer_volume_source='table' but "
+                    f"volume_duration_csv has fewer than 2 rows -- not enough to "
+                    f"derive a CV from. Add more rows, or switch to "
+                    f"mc_outer_volume_source='user' with an explicit mc_outer_volume_cv.")
+            volume_median_scale = 1.0
+            if explicit_volume_cv is not None:
+                volume_cv = explicit_volume_cv
+                volume_source_desc = ("table (median: this case's own inflow_hydrograph.csv, "
+                                       "unchanged) + explicit mc_outer_volume_cv override "
+                                       f"(spread: case-level judgment, NOT the table-derived "
+                                       f"{derived_volume_cv:.4f})")
+            else:
+                volume_cv = derived_volume_cv
+                volume_source_desc = ("table (median: this case's own inflow_hydrograph.csv, "
+                                       "unchanged; spread: flood_duration_volume_table, real data)")
+            print(f"  Outer loop (volume): mc_outer_volume_source='table' -- median stays at this "
+                  f"case's own hydrograph volume (volume_duration_csv used for CV only), "
+                  f"cv={volume_cv:.4f} ({volume_source_desc}); see mc_peak_volume_dependence below "
+                  f"for whether the draws are actually correlated with peak")
+
+        volume_source = volume_source_desc
+
+        dependence_source = mc_sources["dependence_source"]
+        peak_volume_tau = sc.get("mc_peak_volume_tau")
+        if dependence_source != "independent":
+            print(f"  Outer loop (peak-volume DEPENDENCE): mc_peak_volume_dependence="
+                  f"'{dependence_source}', tau={peak_volume_tau:.3f} -- peak_scale and "
+                  f"volume_scale are correlated draws, not independent (see chat/literature "
+                  f"review on copula-based joint peak-volume sampling; marginal medians/CVs "
+                  f"above are UNCHANGED by this, only the correlation between the two draws).")
+
+        outer_draws = default_outer_sampler(rng, n_outer, outer_cv, volume_cv,
+                                             median_scale, volume_median_scale,
+                                             dependence=dependence_source, tau=peak_volume_tau)
+
     inner_draws_by_outer = [
         default_inner_sampler(rng, n_inner, uncertain_params, h0_sigma, area_cv,
                                gate_availability)
@@ -1107,7 +1296,8 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
 
     records = []
     for oi, outer in enumerate(outer_draws):
-        scaled_inflow = ScaledHydrograph(inflow_base, outer["peak_scale"], outer["volume_scale"])
+        scaled_inflow = outer.get("hydrograph") or \
+            ScaledHydrograph(inflow_base, outer["peak_scale"], outer["volume_scale"])
         for ii, inner in enumerate(inner_draws_by_outer[oi]):
             scaled_reservoir = ScaledReservoir(reservoir_base, inner["area_scale"])
             H0_draw = min(max(H0_base + inner["H0_shift"], reservoir_base.H_min),
@@ -1349,7 +1539,13 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
                 f"the DRAWS are actually correlated): {meta['volume_source']}\n")
         f.write(f"Outer-loop median VOLUME scale factor: {meta['volume_median_scale']:.4f}, "
                 f"CV: {meta['volume_cv']:.4f}\n")
-        if meta["dependence_source"] != "independent":
+        if meta["dependence_source"] == "ensemble":
+            f.write(f"Outer-loop peak-volume DEPENDENCE: inherent in the ensemble replicates "
+                    f"(mc_outer_hydrograph_source='ensemble') -- each replicate's own peak, "
+                    f"volume, AND shape are already empirically coherent from the underlying "
+                    f"resampling method, not derived from a copula/tau (see "
+                    f"load_hydrograph_ensemble()'s docstring).\n")
+        elif meta["dependence_source"] != "independent":
             f.write(f"Outer-loop peak-volume DEPENDENCE: mc_peak_volume_dependence="
                     f"'{meta['dependence_source']}', tau={meta['peak_volume_tau']:.3f} -- "
                     f"peak_scale and volume_scale draws ARE correlated (see "

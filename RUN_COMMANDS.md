@@ -134,6 +134,37 @@ labeled variants, rather than picking one number -- the same "run both/
 several, report all, don't pick a winner" pattern already used for the
 FFA bootstrap stress-test case.
 
+### Empirical hydrograph ensemble mode
+
+Optional for every case -- omit the row entirely for the default,
+`"scaled"` mode (this case's own `inflow_hydrograph.csv` scaled by
+`peak_scale`/`volume_scale`, everything above). To opt a case into
+drawing whole hydrographs directly from a pre-generated ensemble file
+instead:
+
+```
+mc_outer_hydrograph_source,ensemble,-
+```
+
+When set, `mc_outer_peak_source`/`mc_outer_volume_source`/
+`mc_peak_volume_dependence` are NOT read or required at all for that
+case -- see `Data/Template/case_config.py`'s
+`mc_outer_hydrograph_source="ensemble"` comments for the required
+`mc_outer_distribution()` `ensemble_csv` key and the expected wide-CSV
+format, and the README's "Empirical hydrograph ensembles" section for
+the full reasoning.
+
+```bash
+uv run python Module/mc_layer3.py <CaseName> --n-outer 300 --n-inner 100
+```
+
+If `--n-outer` exceeds the ensemble's own replicate count, the run
+still proceeds -- Layer 3 caps `n_outer` at the available count and
+prints a clear warning (check the console output/`mc_summary.txt`'s
+"Draws:" line for the actual count used, which may be lower than what
+you requested). Generate more replicates from the ensemble tool itself
+if you need more outer draws than that.
+
 ### Gate-reliability tier switch
 
 Only relevant for a case whose `case_config.py` defines
