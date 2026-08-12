@@ -206,6 +206,46 @@ this -- the switch is entirely a `scalars.csv` value, read via
 `validate_mc_sources()` and passed to that case's own
 `mc_gate_availability(source, p_fail)`.
 
+## Layer 3 outer-loop-only -- isolates climate/flood-frequency spread
+
+```bash
+uv run python Module/mc_layer3_outer_only.py <CaseName> [--n-outer N] [--rule baseline|optimized] [--seed N]
+```
+
+Runs each outer scenario EXACTLY ONCE, with the inner loop held at its
+deterministic BASELINE (no `n_inner` argument -- there's nothing to
+vary): this case's own `H0` unperturbed, `area_scale=1.0`, every
+physical/rating multiplier at its nominal value (`1.0` for
+`lognormal_cv` params, the declared `mean` for `normal` params), and
+ALL gates operational (no failures modeled -- a deliberate
+simplification of this script specifically, not a claim gate failure
+is impossible).
+
+```bash
+uv run python Module/mc_layer3_outer_only.py <CaseName> --n-outer 300
+```
+
+Same case-selection/prompt behavior as the other scripts -- run with no
+arguments to be prompted. Reuses `Module/mc_layer3.py`'s own
+`build_case()`/`build_outer_draws()`, so outer scenarios are drawn
+identically to a full Layer 3 run with the same `scalars.csv` -- same
+`mc_outer_peak_source`/`mc_outer_volume_source`/
+`mc_peak_volume_dependence`/`mc_outer_hydrograph_source` contract, same
+ensemble-capping behavior if applicable.
+
+**What this is for**: comparing this run's peak-level spread against a
+full Layer 3 run's (same case, same `--n-outer`, same seed) isolates
+how much of the reported uncertainty comes from the OUTER loop
+(climate/flood-frequency) versus the INNER loop (physical/rating-
+coefficient and gate-reliability uncertainty) -- a direct, empirical
+answer instead of an inferred one.
+
+Writes: `Output/<CaseName>/OuterOnly/outer_only_results.csv`,
+`Output/<CaseName>/OuterOnly/outer_only_summary.txt`,
+`Plot/<CaseName>/OuterOnly/outer_only_distribution.png` -- separate
+from full Layer 3's `Output/<CaseName>/MonteCarlo/`, so running this
+never overwrites a full run's results.
+
 ## Setup (once, before any of the above)
 
 ```bash

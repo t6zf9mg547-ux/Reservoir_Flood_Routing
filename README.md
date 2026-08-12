@@ -825,6 +825,59 @@ instead of this case's baseline hand-set one (parsed from
 `baseline`. Same interactive-prompt fallback as `run_case.py`/
 `optimize_layer2.py` if run with no arguments.
 
+### Layer 3 outer-loop-only -- isolating climate/flood-frequency spread
+
+```bash
+uv run python Module/mc_layer3_outer_only.py <CaseName> --n-outer 300
+```
+
+A separate script, `Module/mc_layer3_outer_only.py`, runs each outer
+scenario EXACTLY ONCE, with every INNER-loop quantity held at its
+deterministic, unperturbed BASELINE value instead of sampled:
+`H0` exactly this case's own `scalars.csv` value (no `h0_sigma` shift),
+`area_scale=1.0` (no stage-storage curve perturbation), every physical/
+rating multiplier declared in `mc_uncertain_params()` at its nominal
+value (`1.0` for `lognormal_cv` params -- the median of a CV spread
+around nominal IS 1.0; the declared `mean` for `normal` params, since
+those are typically SHIFTS rather than multipliers), and ALL gates
+operational -- no failures modeled at all. That last point is a
+deliberate simplification of this script specifically (not a claim
+that gate failure is impossible), chosen so the isolated comparison
+below is clean: gate-reliability uncertainty is unambiguously an INNER-
+loop quantity, so it's held at its best case here, same as everything
+else in that loop.
+
+**What this answers, that a full Layer 3 run can't in isolation**: "how
+much does peak level vary due to WHICH FLOOD we get, holding every
+physical/reliability uncertainty at its nominal value?" Running this
+script and a full Layer 3 run with the SAME `--n-outer`/`--seed`/case,
+then comparing the two runs' spreads (e.g. their P95-P5 range, or their
+`mc_summary.txt`/`outer_only_summary.txt` standard errors side by
+side), gives a direct, empirical answer to which loop dominates a given
+case's reported uncertainty -- rather than inferring it indirectly from
+a single combined run, the way earlier analysis in this project's
+history had to.
+
+Reuses `Module/mc_layer3.py`'s own `build_case()`/`build_outer_draws()`
+-- the SAME outer-loop derivation logic (all of `mc_outer_peak_source`/
+`mc_outer_volume_source`/`mc_peak_volume_dependence`/
+`mc_outer_hydrograph_source`, including ensemble-mode capping) as the
+full Layer 3 run, so this script's outer scenarios are identical to
+what a full run with the same `scalars.csv` would draw; this script
+deliberately does not duplicate that logic a second time. Its
+`_cluster_bootstrap_stats()`/`_min_realizations_*()`/`_format_margin()`
+reporting machinery is reused too -- with exactly one deterministic
+value per outer scenario, that machinery naturally degenerates into a
+standard, textbook i.i.d. bootstrap/Eq.176-177 check over `n_outer`
+independent scenarios (there's no inner-loop nesting here to correct
+for, unlike full Layer 3's `n_outer`-vs-`n_total` distinction).
+
+Writes: `Output/<CaseName>/OuterOnly/outer_only_results.csv`,
+`Output/<CaseName>/OuterOnly/outer_only_summary.txt`,
+`Plot/<CaseName>/OuterOnly/outer_only_distribution.png` -- a separate
+`OuterOnly/` subfolder, so running this never overwrites or gets
+confused with a full Layer 3 run's own `MonteCarlo/` output.
+
 ## Extensibility built in for later phases
 
 - `outlets.py` also includes `SwitchedOutlet` and `ConstantOutlet` --

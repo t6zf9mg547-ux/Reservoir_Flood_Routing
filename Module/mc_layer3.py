@@ -1090,23 +1090,23 @@ def build_case(case_name: str, rule: str = "baseline"):
 # Main Monte Carlo driver
 # ---------------------------------------------------------------------
 
-def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
-                     rule: str = "baseline") -> tuple[list[dict], dict]:
-    (case_config, case_dir, reservoir_base, inflow_base, withdrawal, sc,
-     rule_overrides, uncertain_params, outer_dist,
-     gate_availability, mc_sources) = build_case(case_name, rule)
+def build_outer_draws(case_name: str, case_dir: str, inflow_base, sc: dict,
+                       outer_dist: dict | None, mc_sources: dict, n_outer: int,
+                       rng: np.random.Generator) -> dict:
+    """Builds this run's outer-loop scenarios (peak_scale/volume_scale
+    pairs, or -- in ensemble mode -- whole hydrographs) from whichever
+    source mc_sources declares. Factored out of run_case_layer3() so
+    Module/mc_layer3_outer_only.py (outer-loop-only sensitivity runs,
+    baseline/deterministic inner loop) can reuse the EXACT same outer-
+    loop derivation logic rather than a second, drift-prone copy of it
+    -- this is the single source of truth for how outer draws get
+    built, for both scripts.
 
-    h0_sigma = sc.get("mc_h0_sigma", H0_DEFAULT_SIGMA)
-    area_cv = sc.get("mc_area_cv", AREA_DEFAULT_CV)
-    threshold = sc.get("downstream_threshold_m3s")
-    max_flood_level = sc.get("max_flood_level")
-    dam_crest_level = sc.get("dam_crest_level")
-    H0_base = sc["H0"]
-    t_max, dt = sc["t_max"], sc["dt"]
-    print_every = int(sc.get("print_every", 1))
-
-    rng = np.random.default_rng(seed)
-
+    Returns a dict: outer_draws, n_outer (possibly reduced by ensemble-
+    mode capping -- ALWAYS use this returned value downstream, not the
+    n_outer passed in), outer_source, volume_source, dependence_source,
+    median_scale, outer_cv, volume_median_scale, volume_cv,
+    target_return_period, peak_volume_tau."""
     if mc_sources["hydrograph_source"] == "ensemble":
         # EMPIRICAL mode: whole hydrographs drawn directly from a pre-
         # generated ensemble, not the peak_scale/volume_scale/copula
@@ -1280,6 +1280,48 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
                                              median_scale, volume_median_scale,
                                              dependence=dependence_source, tau=peak_volume_tau)
 
+
+    return {
+        "outer_draws": outer_draws, "n_outer": n_outer,
+        "outer_source": outer_source, "volume_source": volume_source,
+        "dependence_source": dependence_source,
+        "median_scale": median_scale, "outer_cv": outer_cv,
+        "volume_median_scale": volume_median_scale, "volume_cv": volume_cv,
+        "target_return_period": target_return_period,
+        "peak_volume_tau": peak_volume_tau,
+    }
+
+def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
+                     rule: str = "baseline") -> tuple[list[dict], dict]:
+    (case_config, case_dir, reservoir_base, inflow_base, withdrawal, sc,
+     rule_overrides, uncertain_params, outer_dist,
+     gate_availability, mc_sources) = build_case(case_name, rule)
+
+    h0_sigma = sc.get("mc_h0_sigma", H0_DEFAULT_SIGMA)
+    area_cv = sc.get("mc_area_cv", AREA_DEFAULT_CV)
+    threshold = sc.get("downstream_threshold_m3s")
+    max_flood_level = sc.get("max_flood_level")
+    dam_crest_level = sc.get("dam_crest_level")
+    H0_base = sc["H0"]
+    t_max, dt = sc["t_max"], sc["dt"]
+    print_every = int(sc.get("print_every", 1))
+
+    rng = np.random.default_rng(seed)
+
+    outer = build_outer_draws(case_name, case_dir, inflow_base, sc, outer_dist,
+                               mc_sources, n_outer, rng)
+    outer_draws = outer["outer_draws"]
+    n_outer = outer["n_outer"]
+    outer_source = outer["outer_source"]
+    volume_source = outer["volume_source"]
+    dependence_source = outer["dependence_source"]
+    median_scale = outer["median_scale"]
+    outer_cv = outer["outer_cv"]
+    volume_median_scale = outer["volume_median_scale"]
+    volume_cv = outer["volume_cv"]
+    target_return_period = outer["target_return_period"]
+    peak_volume_tau = outer["peak_volume_tau"]
+
     inner_draws_by_outer = [
         default_inner_sampler(rng, n_inner, uncertain_params, h0_sigma, area_cv,
                                gate_availability)
@@ -1367,6 +1409,20 @@ def run_case_layer3(case_name: str, n_outer: int, n_inner: int, seed: int = 1,
 # ---------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------
+
+def _format_margin(n_outer: int, n_min: float) -> str:
+    """Formats the 'Nx margin' text for a convergence check, guarding
+    against n_min=0 -- a real, if rare, degenerate case: zero output
+    variance (every draw landed on the exact same value, e.g. a hard
+    physical cap saturated on every single draw) makes
+    _min_realizations_mean()'s own formula correctly return 0 (zero
+    realizations trivially suffice when there's nothing to estimate),
+    but n_outer/0 would otherwise crash the reporting step with a bare
+    ZeroDivisionError instead of describing what's actually going on."""
+    if n_min == 0:
+        return "inf (zero variance in this statistic across the run)"
+    return f"{n_outer / n_min:.1f}x"
+
 
 def _min_realizations_mean(sigma: float, mu: float, epsilon: float = 0.01, alpha: float = 0.95) -> float:
     """RMC-TotalRisk Technical Reference Manual, Equation 176: minimum
@@ -1608,9 +1664,9 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
                 f"_cluster_bootstrap_stats()'s docstring for the empirical confirmation "
                 f"(cross-seed comparison) that motivated this: "
                 f"mean needs >={n_min_mean:.0f} independent realizations (this run: {n_outer}, "
-                f"{n_outer / n_min_mean:.1f}x margin); "
+                f"{_format_margin(n_outer, n_min_mean)} margin); "
                 f"P95 needs >={n_min_p95:.0f} independent realizations (this run: {n_outer}, "
-                f"{n_outer / n_min_p95:.1f}x margin)\n")
+                f"{_format_margin(n_outer, n_min_p95)} margin)\n")
         if meta["max_flood_level"] is not None:
             frac = float(np.mean(peak_levels > meta["max_flood_level"]))
             f.write(f"P(peak level > max_flood_level={meta['max_flood_level']}): "
@@ -1641,8 +1697,8 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
     print(f"Convergence (Eq. 176/177, vs. n_outer={n_outer} independent scenarios, "
           f"NOT n_total={n_total} -- see mc_summary.txt for why): "
           f"mean needs >={n_min_mean:.0f} realizations "
-          f"({n_outer / n_min_mean:.1f}x margin); P95 needs >={n_min_p95:.0f} realizations "
-          f"({n_outer / n_min_p95:.1f}x margin)")
+          f"({_format_margin(n_outer, n_min_mean)} margin); P95 needs >={n_min_p95:.0f} realizations "
+          f"({_format_margin(n_outer, n_min_p95)} margin)")
     if meta["max_flood_level"] is not None:
         frac = float(np.mean(peak_levels > meta["max_flood_level"]))
         print(f"P(exceeds max_flood_level) = "
