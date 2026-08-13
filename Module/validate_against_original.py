@@ -20,7 +20,7 @@ ROOT = os.path.dirname(MODULE_DIR)
 ORIGINAL_CSV = "/path/to/your/reference_results.csv"  # <-- EDIT this to your reference file
 
 CASE_NAME = sys.argv[1] if len(sys.argv) > 1 else "Template"
-OUR_CSV = os.path.join(ROOT, "Output", CASE_NAME, "results.csv")
+OUR_CSV = os.path.join(ROOT, "Output", CASE_NAME, "Baseline", "results.csv")
 
 
 def read_original():

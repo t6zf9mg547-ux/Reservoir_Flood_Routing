@@ -92,9 +92,41 @@ def build_outlets(rule_overrides: dict | None = None,
     #    - discharge_coefficient/free_flow_C decide the FLOW through
     #      that opening in each regime (physical rating data)
     # -------------------------------------------------------------
+    # a_max here is the gate's MAXIMUM OPERATIONAL OPENING -- how far
+    # the PLC/operating rule can command it to lift, NOT its physical
+    # leaf height. These are DELIBERATELY kept as two separate
+    # parameters (a_max here, GATE_1_LEAF_HEIGHT below) even though
+    # they happen to coincide for many real vertical-lift gates (a gate
+    # that lifts clear of the sill by exactly its own leaf height is a
+    # common design) -- conflating them by reusing one number for both
+    # is an easy way to silently get the wrong stuck-gate overtop crest
+    # (see GATE_1_LEAF_HEIGHT's own comment below) if your real gate's
+    # travel and its leaf height ever differ, or if you edit one number
+    # later and forget the other reused it too (see chat history for a
+    # real case this happened on). If you're confident they're the
+    # same for your actual gate, set both to the same value explicitly
+    # -- that's a fine, common outcome, just make it a stated fact
+    # about your gate rather than an implicit code assumption.
+    GATE_1_LEAF_HEIGHT = 4.0  # [m] the gate leaf's own physical height
+                              # -- used ONLY to compute where the top of
+                              # a STUCK-CLOSED gate would sit for
+                              # overtopping purposes (see
+                              # gate_1_stuck_example below), never for
+                              # anything operational. EDIT to your
+                              # gate's actual manufactured/as-built leaf
+                              # height, independently of a_max below.
+
     gate_1_params = {
-        "H_open": 98.0,  # [m a.s.l.] level at which the gate starts to open
-        "H_full": 99.5,  # [m a.s.l.] level at which the gate reaches a_max
+        "H_open": 98.0,  # [m a.s.l.] level above which the gate is
+                         # triggered -- NOT a gradual start from zero:
+                         # the opening JUMPS straight from closed (0) to
+                         # a_min the instant H exceeds this level (see
+                         # a_min's own comment below for why), then
+                         # ramps from there. Below this level, closed.
+        "H_full": 99.5,  # [m a.s.l.] level at/above which the gate
+                         # HOLDS at a_max (fully open) -- the ramp from
+                         # a_min to a_max happens linearly between
+                         # H_open and this level, not above it.
         "a_min": 0.5,    # [m] SMALLEST opening the gate is allowed once
                          # triggered -- it jumps straight from closed (0)
                          # to a_min rather than creeping through
@@ -102,12 +134,16 @@ def build_outlets(rule_overrides: dict | None = None,
                          # seal in a partially-open position under head
                          # (accelerated seal wear / cavitation risk).
                          # EDIT to your gate's minimum-safe-opening spec.
-        "a_max": 3.0,    # [m] maximum physical gate opening -- make sure
-                         # this is large enough relative to your design
-                         # flood head if you want the gate to reach and
-                         # stay in the free-flow regime (see GatedSpillway
-                         # docstring: it can revert to the gated/orifice
-                         # formula at very high heads if a_max is too small)
+        "a_max": 3.0,    # [m] maximum OPERATIONAL opening -- how far the
+                         # PLC will ever command this gate to lift. NOT
+                         # necessarily the same number as
+                         # GATE_1_LEAF_HEIGHT above (see that comment) --
+                         # make sure this is large enough relative to
+                         # your design flood head if you want the gate
+                         # to reach and stay in the free-flow regime
+                         # (see GatedSpillway docstring: it can revert
+                         # to the gated/orifice formula at very high
+                         # heads if a_max is too small).
     }
     gate_1_params.update(rule_overrides.get("gate_1", {}))
     gate_1_rule = level_trigger_rule(**gate_1_params)
@@ -177,8 +213,13 @@ def build_outlets(rule_overrides: dict | None = None,
     #
     # gate_1_stuck_example = FreeOverflowSpillway(
     #     name="gate_1_stuck",
-    #     crest_level=95.0 + 4.0,  # top of the closed gate leaf =
-    #                              # sill_level + this gate's own a_max
+    #     crest_level=95.0 + GATE_1_LEAF_HEIGHT,  # top of the closed gate
+    #                              # leaf = sill_level + the gate's own
+    #                              # LEAF HEIGHT -- deliberately NOT
+    #                              # a_max (see GATE_1_LEAF_HEIGHT's own
+    #                              # comment above for why these are two
+    #                              # separate parameters, not one reused
+    #                              # number)
     #     length=8.0,              # same width as one gate_1 bay
     #     C=1.86,                  # discharge coefficient for flow
     #                              # OVER a closed gate leaf -- NOT the
@@ -336,7 +377,12 @@ def optimizable_gates():
                                        # constraint, not via these bounds
             "a_min": (0.2, 1.0),       # [m] -- must be < a_max, also
                                        # enforced as a constraint
-            "a_max": (0.5, 4.0),       # [m]
+            "a_max": (0.5, 4.0),       # [m] -- upper bound should not
+                                       # exceed this gate's own
+                                       # GATE_1_LEAF_HEIGHT (build_outlets()
+                                       # above) -- the optimizer can't
+                                       # tune the operational a_max past
+                                       # what the gate can physically lift
         },
         "bottom_outlet_1": {
             "H_open": (88.0, 93.0),   # [m a.s.l.]

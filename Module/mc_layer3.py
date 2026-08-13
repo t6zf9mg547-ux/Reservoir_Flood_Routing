@@ -140,18 +140,25 @@ class EnsembleHydrograph:
     """A single ensemble replicate used DIRECTLY as an outer scenario's
     forcing hydrograph -- mc_outer_hydrograph_source="ensemble" mode.
     Same minimal interface ScaledHydrograph/Hydrograph expose to the
-    rest of this file (.t, .Q, .discharge(t) via linear interpolation,
-    zero outside the tabulated range -- same convention as the real
-    Hydrograph class) -- but built directly from an in-memory (t, Q)
-    pair instead of a CSV path, since load_hydrograph_ensemble() reads
-    hundreds of replicates from ONE file and there's no reason to
-    round-trip each one through disk."""
+    rest of this file (.t, .Q, .discharge(t) via linear interpolation)
+    -- but built directly from an in-memory (t, Q) pair instead of a
+    CSV path, since load_hydrograph_ensemble() reads hundreds of
+    replicates from ONE file and there's no reason to round-trip each
+    one through disk.
+
+    Boundary behavior OUTSIDE the tabulated range matches the real
+    Hydrograph class exactly (Module/hydrograph.py): holds the first/
+    last tabulated value CONSTANT, not zero -- an earlier version of
+    this class used zero-padding instead, which both silently disagreed
+    with every other hydrograph object in this project and made a false
+    claim in its own docstring that it matched. Fixed after an
+    attentive full-codebase check (see chat)."""
     def __init__(self, t: np.ndarray, Q: np.ndarray):
         self.t = t
         self.Q = Q
 
     def discharge(self, t):
-        return np.interp(t, self.t, self.Q, left=0.0, right=0.0)
+        return float(np.interp(t, self.t, self.Q))
 
 
 class ScaledHydrograph:

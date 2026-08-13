@@ -235,12 +235,29 @@ gate that's stuck closed due to a mechanical/electrical fault or
 maintenance -- such a gate usually can still be passively OVERTOPPED
 like a fixed weir if the reservoir rises high enough over the top of
 the (immobile) leaf. Model that instead as a `FreeOverflowSpillway`
-with `crest_level = sill_level + a_max` (the top of the closed gate
-leaf) and its OWN discharge coefficient -- deliberately NOT the same
-value as `free_flow_C`, which is calibrated for a gate intentionally
-lifted clear of the flow, a different hydraulic geometry than water
-passing over a fixed closed leaf. See `Data/Template/case_config.py`'s
-commented-out `gate_1_stuck_example` for the pattern.
+with `crest_level = sill_level + <the gate's own physical leaf
+height>` (the top of the closed gate leaf) and its OWN discharge
+coefficient -- deliberately NOT the same value as `free_flow_C`, which
+is calibrated for a gate intentionally lifted clear of the flow, a
+different hydraulic geometry than water passing over a fixed closed
+leaf.
+
+Use a SEPARATE, explicitly-named constant for the gate's physical leaf
+height (e.g. `GATE_1_LEAF_HEIGHT` in `Data/Template/case_config.py`'s
+`gate_1_stuck_example`) -- deliberately NOT the operating rule's own
+`a_max`, even though the two often coincide (a common, valid design
+for a vertical-lift gate whose full travel clears it completely from
+the flow path). `a_max` is how far the PLC will ever COMMAND the gate
+to lift -- an operational limit; leaf height is a physical dimension of
+the gate itself. Reusing one number for both is an easy way to
+silently get the wrong overtop crest if your real gate's maximum
+travel and its leaf height ever differ, or if one gets edited later
+and the other doesn't (this happened for real on this project -- see
+chat history). If you're confident they're the same for your actual
+gate, set both constants to the same value explicitly; that's a fine,
+common outcome, just make it a stated fact about your gate rather than
+an implicit, reused number. See `Data/Template/case_config.py`'s
+commented-out `gate_1_stuck_example` for the worked pattern.
 
 ## Why outlets are Python objects, not CSV rows
 
