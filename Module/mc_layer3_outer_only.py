@@ -317,30 +317,32 @@ def summarize_and_write(case_name: str, records: list[dict], meta: dict) -> None
     print(f"\nPeak level [m a.s.l.]: P5={p5:.3f}  P50={p50:.3f}  P95={p95:.3f}  mean={mean_level:.3f}")
 
 
-def prompt_str(label: str, default: str) -> str:
-    val = input(f"{label} [{default}]: ").strip()
-    return val if val else default
-
-
 def prompt_int(label: str, default: int) -> int:
-    val = input(f"{label} [{default}]: ").strip()
-    return int(val) if val else default
+    raw = input(f"{label} [default {default}]: ").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"Not a valid integer, using default ({default}).")
+        return default
 
 
 def main():
     parser = argparse.ArgumentParser(description="Layer 3 outer-loop-only sensitivity run")
     parser.add_argument("case_name", nargs="?", default=None)
     parser.add_argument("--n-outer", type=int, default=None)
-    parser.add_argument("--rule", choices=["baseline", "optimized"], default=None)
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--rule", choices=["baseline", "optimized"], default="baseline")
+    parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
 
-    case_name = args.case_name or prompt_str("Case name", "Template")
-    n_outer = args.n_outer if args.n_outer is not None else prompt_int("Number of outer draws", 100)
-    rule = args.rule or "baseline"
-    seed = args.seed if args.seed is not None else 1
+    case_name = args.case_name or mc_layer3.prompt_for_case(mc_layer3.list_case_folders())
+    n_outer = args.n_outer if args.n_outer is not None else prompt_int("Number of outer (climate) draws", 100)
 
-    records, meta = run_case_outer_only(case_name, n_outer, seed=seed, rule=rule)
+    print(f"\nRunning Layer 3 outer-loop-only for '{case_name}': "
+          f"{n_outer} outer draws, baseline inner loop, rule='{args.rule}'\n")
+
+    records, meta = run_case_outer_only(case_name, n_outer, seed=args.seed, rule=args.rule)
     summarize_and_write(case_name, records, meta)
 
 
