@@ -8,6 +8,11 @@ continuity equation
 for a single dam with multiple outlet works (ungated spillways, gated
 spillways, fuse gates, bottom outlets).
 
+See `RUN_COMMANDS.md` for a quick reference of every standard command.
+Onboarding a new dam/case? Start with `NEW_CASE_CHECKLIST.md`, not this
+file. `CLAUDE.md` has working conventions for Claude Code sessions in
+this repo.
+
 ## How to run
 
 ```
