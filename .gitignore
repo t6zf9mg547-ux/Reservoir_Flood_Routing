@@ -48,3 +48,10 @@ dist/
 
 # Logs
 *.log
+
+# mnema memory store: track log.jsonl + config.json (source of truth),
+# ignore the derived vector/state caches (rebuild automatically from the
+# log on the next mnema command)
+Resources/.mnema/vec_*.f16
+Resources/.mnema/state.npz
+Resources/.mnema/views.npz

@@ -252,6 +252,22 @@ never overwrites a full run's results.
 uv sync
 ```
 
+## Memory (mnema)
+
+See `CLAUDE.md` → "Memory (mnema)" for what each store is and when to use
+it. Commands only, here.
+
+```bash
+mnema ask "<question>"                                       # root: doctrine + full library + every project
+mnema --store ./Resources/.mnema ask --local "<question>"    # this project's own decisions only
+mnema --store ./Resources/.mnema remember "<decision and why>"
+```
+
+If it's slow (~10s per call), start the warm-model daemon once per machine:
+```bash
+mnema serve &
+```
+
 ## Git (this repo specifically)
 
 `master` (local) tracks `origin/Master` (remote) -- a case-sensitivity

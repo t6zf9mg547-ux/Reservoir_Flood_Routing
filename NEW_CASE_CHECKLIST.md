@@ -20,6 +20,16 @@ one. If a number isn't known yet, write "TBD — see [source]" rather
 than a plausible-looking placeholder; a placeholder that looks real is
 easy to forget to revisit later.
 
+**Before gathering features, query mnema root** (`mnema ask "<dam name,
+spillway/gate type, region, or design-flood method>"`, no `--store` —
+see this project's `CLAUDE.md` → "Memory (mnema)") for prior cases in
+this project and relevant literature — spillway/gate design references,
+regional flood-frequency data, known failure modes for this dam type.
+Follow `<related>` hits a couple of hops (`mnema show <hash>`, `mnema
+ask --from <vault> "..."`) rather than stopping at the first result —
+see the global "Stage zero" instructions. A `sparse`/`unwritten` verdict
+with nothing on-topic is a normal outcome; note it and move on.
+
 **Reservoir**
 - [ ] Stage-storage/surface curve source (survey? design report table?)
       and its format — becomes `reservoir_curve.csv`

@@ -105,6 +105,32 @@ contract, including the optional `mc_peak_volume_dependence` and
 - No changelog for this project (explicitly not wanted) -- don't
   create or reference a `CHANGELOG.md`.
 
+## Memory (mnema)
+
+This project is registered on the machine's root mnema store (`~/.mnema`,
+as `project-Reservoir_Flood_Routing`) — see `~/.claude/CLAUDE.md` for the
+full root/vault architecture and usage contract. Two stores matter here:
+
+- **local** (`./Resources/.mnema`) — this project's own decisions.
+  Writable; `remember` always writes here, never to root or a vault.
+- **root** (`~/.mnema`, mnema's own default — plain `mnema ask` with no
+  `--store` flag hits this) — spans doctrine, the full research library,
+  and every other project in one call, this project's own store included.
+
+When to use it:
+
+- **Before a non-trivial design choice** (new case features, changes to
+  the generic-engine/case-specific split, Layer 3 uncertainty-modeling
+  choices), ask root first: `mnema ask "<question>"`. To scope to just
+  this project's own prior decisions: `mnema --store ./Resources/.mnema
+  ask --local "<question>"`.
+- **After a design is confirmed**, remember the conclusion, not the
+  discussion: `mnema --store ./Resources/.mnema remember "<decision and
+  why, one belief per entry>"`.
+- **If something learned here is genuinely reusable across projects**
+  (not case-specific), promote it to doctrine deliberately:
+  `mnema --store ~/MyProjects/MyPython/.mnema-doctrine remember "<reusable convention>"`.
+
 ## General rules
 
 - Don't add error handling, abstractions, or config options for cases

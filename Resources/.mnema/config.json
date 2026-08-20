@@ -1,0 +1,9 @@
+{
+  "model": "Alibaba-NLP/gte-modernbert-base",
+  "dim": 4096,
+  "beta": 1.0,
+  "sigma": null,
+  "seed": 7,
+  "d_embed": 768,
+  "version": 1
+}
